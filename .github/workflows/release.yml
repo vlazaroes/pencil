@@ -1,16 +1,27 @@
-# Publishes a GitHub release with PencilSetup.exe when a version tag is pushed:
-#   1. bump `version` in Cargo.toml and commit
-#   2. git tag v1.2.3 && git push origin v1.2.3
-# Installed copies pick the new release up the next time they start.
+# Publishes a new version with one click: Actions > Release > Run workflow.
+#
+# It bumps `version` in Cargo.toml (or keeps it with "current"), builds, commits the
+# bump to the branch it runs on, tags it vX.Y.Z, packages installer/pencil.iss with
+# Inno Setup and publishes PencilSetup.exe as a GitHub release.
+# Installed copies pick it up the next time they start.
 
 name: Release
 
 on:
-  push:
-    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump"
+        type: choice
+        options: [patch, minor, major, current]
+        default: patch
 
 permissions:
   contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -18,16 +29,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check tag matches Cargo.toml version
+      - name: Compute version
+        id: version
         shell: pwsh
         run: |
-          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-          if ("v$v" -ne "${{ github.ref_name }}") {
-            throw "Tag ${{ github.ref_name }} does not match Cargo.toml version $v"
+          $current = (Select-String -Path Cargo.toml -Pattern '^version = "(\d+)\.(\d+)\.(\d+)"').Matches[0]
+          if (-not $current) { throw "No x.y.z version found in Cargo.toml" }
+          [int]$major = $current.Groups[1].Value
+          [int]$minor = $current.Groups[2].Value
+          [int]$patch = $current.Groups[3].Value
+          switch ("${{ inputs.bump }}") {
+            "major"   { $major++; $minor = 0; $patch = 0 }
+            "minor"   { $minor++; $patch = 0 }
+            "patch"   { $patch++ }
+            "current" { }
           }
+          $version = "$major.$minor.$patch"
+          if (git ls-remote --tags origin "refs/tags/v$version") { throw "Tag v$version already exists" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "Releasing v$version"
 
+      - name: Set version in Cargo.toml
+        shell: pwsh
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          $toml = Get-Content Cargo.toml -Raw
+          $toml = [regex]::Replace($toml, '(?m)^version = "[^"]+"', "version = `"$v`"", 1)
+          [IO.File]::WriteAllText("$PWD\Cargo.toml", $toml)
+
+      # Also refreshes this package's own entry in Cargo.lock; dependencies stay as locked.
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release
 
       - name: Install Inno Setup
         shell: pwsh
@@ -39,11 +71,24 @@ jobs:
       - name: Build installer
         shell: pwsh
         run: |
-          $v = "${{ github.ref_name }}".TrimStart('v')
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$v" installer\pencil.iss
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=${{ steps.version.outputs.version }}" installer\pencil.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Only once everything is built, so a failure never leaves a tag without a release.
+      - name: Commit and tag
+        shell: pwsh
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) { git commit -m "chore: release v$v" }
+          git tag "v$v"
+          git push origin "HEAD:${{ github.ref_name }}"
+          git push origin "v$v"
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" installer/Output/PencilSetup.exe --title "Pencil ${{ github.ref_name }}" --generate-notes
+        run: gh release create "v${{ steps.version.outputs.version }}" installer/Output/PencilSetup.exe --title "Pencil v${{ steps.version.outputs.version }}" --generate-notes

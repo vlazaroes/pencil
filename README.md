@@ -66,9 +66,11 @@ Closing it clears the drawing and frees all of its memory.
 
 ## Releasing a new version
 
-1. Bump `version` in `Cargo.toml` and commit.
-2. `git tag v1.2.3 && git push origin v1.2.3`
+On GitHub: *Actions* > *Release* > *Run workflow*, and pick the bump
+(`patch`, `minor`, `major`, or `current` to publish the version as it is).
+From a terminal: `gh workflow run release.yml -f bump=patch`.
 
-The `Release` workflow builds the app, packages `installer/pencil.iss` with
-Inno Setup and publishes `PencilSetup.exe` as a GitHub release. Installed copies
-pick it up the next time they start.
+The workflow bumps `version` in `Cargo.toml`, builds the app, packages
+`installer/pencil.iss` with Inno Setup, commits the bump, tags it `vX.Y.Z` and
+publishes `PencilSetup.exe` as a GitHub release. Installed copies pick it up the
+next time they start.
