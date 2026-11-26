@@ -7,7 +7,7 @@ description = "Full-screen drawing overlay toggled by a global hotkey (Windows)"
 [dependencies]
 # Pure Rust deflate, used only to compress screenshot PNGs.
 miniz_oxide = "0.9"
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
