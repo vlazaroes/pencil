@@ -28,9 +28,13 @@ const CLASS: &str = "PencilSettings";
 const TITLE: &str = "Settings";
 
 /// Labels in `ctl` index order (hotkeys, then theme). The theme row is shown first.
-const LABELS: [&str; 5] = ["Show / Hide", "Color", "Size", "Erase", "Theme"];
+const LABELS: [&str; ROWS] = ["Show / Hide", "Color", "Size", "Erase", "Capture", "Theme"];
 /// Visual row of each `ctl` index.
-const ROW: [i32; 5] = [1, 2, 3, 4, 0];
+const ROW: [i32; ROWS] = [1, 2, 3, 4, 5, 0];
+/// Form rows: the show/hide hotkey, the tool keys, then the theme.
+const ROWS: usize = 6;
+/// Index of the theme combo box in `ctl` (the hotkey controls come before it).
+const THEME: usize = ROWS - 1;
 const THEMES: [&str; 3] = ["System", "Light", "Dark"];
 
 // Hotkey control messages and flags (commctrl.h).
@@ -59,9 +63,9 @@ const EX_STYLE: u32 = WS_EX_DLGMODALFRAME | WS_EX_APPWINDOW;
 struct Win {
     hwnd: HWND,
     font: HFONT,
-    labels: [HWND; 5],
-    /// Hotkey, pencil, size and clear hotkey controls, then the theme combo box.
-    ctl: [HWND; 5],
+    labels: [HWND; ROWS],
+    /// Show/hide, pencil, size, clear and capture hotkey controls, then the theme combo box.
+    ctl: [HWND; ROWS],
     /// "Start with Windows" check box.
     autostart: HWND,
     ok: HWND,
@@ -131,9 +135,9 @@ pub fn open(hinst: HINSTANCE, owner: HWND, cfg: &Config) {
         };
         let labels = LABELS.map(|l| child("STATIC", l, SS_CENTERIMAGE, 0));
         // Creation order is the Tab order: theme first, matching the visual order.
-        let mut ctl = [null_mut(); 5];
-        ctl[4] = child("COMBOBOX", "", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32, 104);
-        for (i, c) in ctl.iter_mut().take(4).enumerate() {
+        let mut ctl = [null_mut(); ROWS];
+        ctl[THEME] = child("COMBOBOX", "", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32, 110);
+        for (i, c) in ctl.iter_mut().take(THEME).enumerate() {
             *c = child(HOTKEY_CLASS, "", WS_TABSTOP, 100 + i);
         }
         let autostart = child("BUTTON", "Start with Windows", WS_TABSTOP | BS_AUTOCHECKBOX as u32, 105);
@@ -143,18 +147,18 @@ pub fn open(hinst: HINSTANCE, owner: HWND, cfg: &Config) {
         // Show/hide must contain Ctrl or Alt: plain keys and Shift+key become Ctrl+Alt+key.
         SendMessageW(ctl[0], HKM_SETRULES, HKCOMB_NONE | HKCOMB_S, (HOTKEYF_CONTROL | HOTKEYF_ALT) as LPARAM);
         // Tool shortcuts are single keys: any modifier is dropped.
-        for c in &ctl[1..4] {
+        for c in &ctl[1..THEME] {
             SendMessageW(*c, HKM_SETRULES, HKCOMB_ANY_MOD, 0);
         }
         set_hotkey(ctl[0], cfg.hotkey);
-        for (c, vk) in ctl[1..4].iter().zip(cfg.keys.all()) {
+        for (c, vk) in ctl[1..THEME].iter().zip(cfg.keys.all()) {
             set_hotkey(*c, Hotkey { mods: 0, vk: vk as u32 });
         }
         for t in THEMES {
             let w = wide(t);
-            SendMessageW(ctl[4], CB_ADDSTRING, 0, w.as_ptr() as LPARAM);
+            SendMessageW(ctl[THEME], CB_ADDSTRING, 0, w.as_ptr() as LPARAM);
         }
-        SendMessageW(ctl[4], CB_SETCURSEL, cfg.theme as usize, 0);
+        SendMessageW(ctl[THEME], CB_SETCURSEL, cfg.theme as usize, 0);
         let checked = if autostart_enabled() { BST_CHECKED } else { BST_UNCHECKED };
         SendMessageW(autostart, BM_SETCHECK, checked as WPARAM, 0);
 
@@ -176,7 +180,7 @@ pub fn open(hinst: HINSTANCE, owner: HWND, cfg: &Config) {
         }
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
-        SetFocus(ctl[4]);
+        SetFocus(ctl[THEME]);
     }
 }
 
@@ -206,11 +210,11 @@ unsafe fn layout(mut w: Win, dpi: u32) -> Win {
         let y = margin + row * (row_h + gap);
         MoveWindow(w.labels[i], margin, y, label_w, row_h, 1);
         // A combo box height includes its drop-down list.
-        let h = if i == 4 { row_h + sc(120) } else { row_h };
+        let h = if i == THEME { row_h + sc(120) } else { row_h };
         MoveWindow(w.ctl[i], ctl_x, y, ctl_w, h, 1);
     }
     let client_w = ctl_x + ctl_w + margin;
-    let mut y = margin + 5 * (row_h + gap);
+    let mut y = margin + ROWS as i32 * (row_h + gap);
     MoveWindow(w.autostart, ctl_x, y, ctl_w, row_h, 1);
     y += row_h + gap + sc(6);
     MoveWindow(w.cancel, client_w - margin - btn_w, y, btn_w, row_h + sc(2), 1);
@@ -262,8 +266,8 @@ unsafe fn read_form(w: &Win) -> Result<Config, String> {
     if !hotkey.is_valid() {
         return Err("The Show / Hide shortcut must include Ctrl or Alt plus another key.".into());
     }
-    let k = [1, 2, 3].map(|i| get_hotkey(w.ctl[i]).vk as u16);
-    let keys = Keys { pencil: k[0], size: k[1], clear: k[2] };
+    let k = [1, 2, 3, 4].map(|i| get_hotkey(w.ctl[i]).vk as u16);
+    let keys = Keys { pencil: k[0], size: k[1], clear: k[2], capture: k[3] };
     if k.contains(&0) {
         return Err("Every tool needs a shortcut.".into());
     }
@@ -274,7 +278,7 @@ unsafe fn read_form(w: &Win) -> Result<Config, String> {
                 .into(),
         );
     }
-    let sel = SendMessageW(w.ctl[4], CB_GETCURSEL, 0, 0);
+    let sel = SendMessageW(w.ctl[THEME], CB_GETCURSEL, 0, 0);
     let theme = ThemePref::from_index(sel.max(0) as u32);
     Ok(Config { hotkey, keys, theme })
 }

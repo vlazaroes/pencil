@@ -21,9 +21,9 @@ use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Networking::WinHttp::*;
-use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
 use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindow, PostMessageW, WM_APP};
 
+use crate::config::read_reg_sz;
 use crate::wide;
 
 const HOST: &str = "github.com";
@@ -209,21 +209,6 @@ fn is_installed_copy() -> bool {
     };
     let norm = |s: &str| s.trim_end_matches('\\').to_lowercase();
     norm(&dir) == norm(&exe_dir.to_string_lossy())
-}
-
-fn read_reg_sz(key: &str, name: &str) -> Option<String> {
-    let key = wide(key);
-    let name = wide(name);
-    let mut buf = [0u16; 1024];
-    let mut len = std::mem::size_of_val(&buf) as u32;
-    let rc = unsafe {
-        RegGetValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr(), RRF_RT_REG_SZ, null_mut(), buf.as_mut_ptr().cast(), &mut len)
-    };
-    if rc != 0 {
-        return None;
-    }
-    let n = (len as usize / 2).saturating_sub(1); // bytes -> chars, minus the terminator
-    Some(String::from_utf16_lossy(&buf[..n]))
 }
 
 // ---------------------------------------------------------------- WinHTTP
