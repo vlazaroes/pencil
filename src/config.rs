@@ -1,13 +1,59 @@
 //! User settings, persisted as DWORD values under `HKCU\Software\Pencil`.
 
 use windows_sys::Win32::System::Registry::{
-    RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_DWORD, RRF_RT_REG_DWORD,
+    RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_DWORD, REG_SZ,
+    RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
 use crate::wide;
 
 const REG_KEY: &str = "Software\\Pencil";
+/// Per-user "run at logon" list. The installer adds the value on a fresh install;
+/// afterwards only the Settings window changes it (updates never touch it).
+const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const RUN_VALUE: &str = "Pencil";
+
+/// Whether Pencil is set to start with Windows.
+pub fn autostart_enabled() -> bool {
+    let key = wide(RUN_KEY);
+    let name = wide(RUN_VALUE);
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    rc == 0
+}
+
+/// Adds (pointing at the running executable) or removes the logon entry.
+pub fn set_autostart(on: bool) -> bool {
+    let key = wide(RUN_KEY);
+    let name = wide(RUN_VALUE);
+    unsafe {
+        if on {
+            let Ok(exe) = std::env::current_exe() else { return false };
+            let cmd = wide(&format!("\"{}\"", exe.display()));
+            RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                key.as_ptr(),
+                name.as_ptr(),
+                REG_SZ,
+                cmd.as_ptr().cast(),
+                (cmd.len() * 2) as u32,
+            ) == 0
+        } else {
+            let rc = RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr());
+            rc == 0 || rc == 2 // ERROR_FILE_NOT_FOUND: already off
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ThemePref {

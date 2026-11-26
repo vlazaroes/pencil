@@ -2,6 +2,20 @@
 
 Full-screen drawing overlay for Windows, in pure Rust (only `windows-sys`).
 
+## Install
+
+Download `PencilSetup.exe` from the
+[latest release](https://github.com/vlazaroes/pencil/releases/latest) and run it.
+It installs per user (no admin rights) into `%LOCALAPPDATA%\Programs\Pencil`, adds a
+Start menu entry and, by default, starts Pencil with Windows (can be turned off in
+*Settings*). Uninstall from Windows Settings > Apps.
+
+Installed copies check GitHub for a newer release once per start and, if there is
+one, download it and update themselves silently (never while you are drawing or
+have Settings open).
+
+## Build from source
+
 ```
 cargo build --release
 target\release\pencil.exe
@@ -40,3 +54,12 @@ Closing it clears the drawing and frees all of its memory.
 - With the overlay: a single bitmap the size of the virtual desktop (4 bytes/pixel);
   only the modified rectangle is sent to the compositor on each move.
 - No GPU work of its own: composition is done by DWM, like any other window.
+
+## Releasing a new version
+
+1. Bump `version` in `Cargo.toml` and commit.
+2. `git tag v1.2.3 && git push origin v1.2.3`
+
+The `Release` workflow builds the app, packages `installer/pencil.iss` with
+Inno Setup and publishes `PencilSetup.exe` as a GitHub release. Installed copies
+pick it up the next time they start.

@@ -12,12 +12,16 @@ use windows_sys::Win32::Graphics::Gdi::{
     CreateFontIndirectW, DeleteObject, GetMonitorInfoW, COLOR_BTNFACE, MonitorFromPoint, HFONT, MONITORINFO,
     MONITOR_DEFAULTTONEAREST,
 };
-use windows_sys::Win32::UI::Controls::{InitCommonControlsEx, ICC_HOTKEY_CLASS, INITCOMMONCONTROLSEX};
+use windows_sys::Win32::UI::Controls::{
+    InitCommonControlsEx, BST_CHECKED, BST_UNCHECKED, ICC_HOTKEY_CLASS, INITCOMMONCONTROLSEX,
+};
 use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForMonitor, SystemParametersInfoForDpi, MDT_EFFECTIVE_DPI};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetFocus, MOD_ALT, MOD_CONTROL, MOD_SHIFT};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::config::{hotkey_text, is_extended, Config, Hotkey, Keys, ThemePref};
+use crate::config::{
+    autostart_enabled, hotkey_text, is_extended, set_autostart, Config, Hotkey, Keys, ThemePref,
+};
 use crate::wide;
 
 const CLASS: &str = "PencilSettings";
@@ -58,6 +62,8 @@ struct Win {
     labels: [HWND; 5],
     /// Hotkey, pencil, size and clear hotkey controls, then the theme combo box.
     ctl: [HWND; 5],
+    /// "Start with Windows" check box.
+    autostart: HWND,
     ok: HWND,
     cancel: HWND,
 }
@@ -130,6 +136,7 @@ pub fn open(hinst: HINSTANCE, owner: HWND, cfg: &Config) {
         for (i, c) in ctl.iter_mut().take(4).enumerate() {
             *c = child(HOTKEY_CLASS, "", WS_TABSTOP, 100 + i);
         }
+        let autostart = child("BUTTON", "Start with Windows", WS_TABSTOP | BS_AUTOCHECKBOX as u32, 105);
         let ok = child("BUTTON", "OK", WS_TABSTOP | BS_DEFPUSHBUTTON as u32, IDOK as usize);
         let cancel = child("BUTTON", "Cancel", WS_TABSTOP | BS_PUSHBUTTON as u32, IDCANCEL as usize);
 
@@ -148,8 +155,10 @@ pub fn open(hinst: HINSTANCE, owner: HWND, cfg: &Config) {
             SendMessageW(ctl[4], CB_ADDSTRING, 0, w.as_ptr() as LPARAM);
         }
         SendMessageW(ctl[4], CB_SETCURSEL, cfg.theme as usize, 0);
+        let checked = if autostart_enabled() { BST_CHECKED } else { BST_UNCHECKED };
+        SendMessageW(autostart, BM_SETCHECK, checked as WPARAM, 0);
 
-        let win = Win { hwnd, font: null_mut(), labels, ctl, ok, cancel };
+        let win = Win { hwnd, font: null_mut(), labels, ctl, autostart, ok, cancel };
         let win = layout(win, dpi);
         WIN.with(|w| w.set(Some(win)));
 
@@ -182,7 +191,7 @@ unsafe fn layout(mut w: Win, dpi: u32) -> Win {
     } else {
         null_mut()
     };
-    let all = w.labels.iter().chain(w.ctl.iter()).chain([&w.ok, &w.cancel]);
+    let all = w.labels.iter().chain(w.ctl.iter()).chain([&w.autostart, &w.ok, &w.cancel]);
     for c in all {
         SendMessageW(*c, WM_SETFONT, font as WPARAM, 0);
     }
@@ -200,9 +209,10 @@ unsafe fn layout(mut w: Win, dpi: u32) -> Win {
         let h = if i == 4 { row_h + sc(120) } else { row_h };
         MoveWindow(w.ctl[i], ctl_x, y, ctl_w, h, 1);
     }
-    let mut y = margin + 5 * (row_h + gap);
-    y += sc(6);
     let client_w = ctl_x + ctl_w + margin;
+    let mut y = margin + 5 * (row_h + gap);
+    MoveWindow(w.autostart, ctl_x, y, ctl_w, row_h, 1);
+    y += row_h + gap + sc(6);
     MoveWindow(w.cancel, client_w - margin - btn_w, y, btn_w, row_h + sc(2), 1);
     MoveWindow(w.ok, client_w - margin - 2 * btn_w - sc(8), y, btn_w, row_h + sc(2), 1);
     let client_h = y + row_h + sc(2) + margin;
@@ -281,13 +291,23 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             match (wp & 0xFFFF) as i32 {
                 IDOK => {
                     let Some(w) = WIN.with(|w| w.get()) else { return 0 };
-                    let result = read_form(&w).and_then(|cfg| {
-                        if crate::apply_settings(cfg) {
-                            Ok(())
-                        } else {
-                            Err(format!("{} is already in use by another program.", hotkey_text(cfg.hotkey)))
-                        }
-                    });
+                    let autostart = SendMessageW(w.autostart, BM_GETCHECK, 0, 0) == BST_CHECKED as LRESULT;
+                    // Autostart first: it can be retried freely, registering the hotkey cannot.
+                    let result = read_form(&w)
+                        .and_then(|cfg| {
+                            if autostart == autostart_enabled() || set_autostart(autostart) {
+                                Ok(cfg)
+                            } else {
+                                Err("Could not change the \"Start with Windows\" setting.".into())
+                            }
+                        })
+                        .and_then(|cfg| {
+                            if crate::apply_settings(cfg) {
+                                Ok(())
+                            } else {
+                                Err(format!("{} is already in use by another program.", hotkey_text(cfg.hotkey)))
+                            }
+                        });
                     match result {
                         Ok(()) => {
                             DestroyWindow(hwnd);

@@ -20,10 +20,11 @@ mod gdi;
 mod overlay;
 mod raster;
 mod settings;
+mod updater;
 
 use std::cell::RefCell;
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT,
@@ -55,6 +56,11 @@ const DEFAULT_SIZE: usize = 1;
 
 const WM_APP_HIDE: u32 = WM_APP + 1;
 const WM_APP_TRAY: u32 = WM_APP + 2;
+// WM_APP + 3 and + 4 are used by the update checker (see updater.rs).
+/// Retry timer for an update that arrived while the user was busy.
+const TIMER_INSTALL: usize = 1;
+/// Timer that launches the next update check.
+const TIMER_CHECK: usize = 2;
 const ID_SHOW: usize = 1;
 const ID_QUIT: usize = 2;
 const ID_SETTINGS: usize = 3;
@@ -63,6 +69,8 @@ const ID_SETTINGS: usize = 3;
 /// to it from anywhere without taking a borrow.
 static CTRL: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(null_mut());
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+/// Update checks launched so far in this run.
+static UPDATE_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
 
 struct App {
     hinst: HINSTANCE,
@@ -209,7 +217,7 @@ fn hotkey_taken_text(h: Hotkey) -> String {
 }
 
 fn tray_tip(cfg: &Config) -> String {
-    format!("Pencil ({})", hotkey_text(cfg.hotkey))
+    format!("Pencil {} ({})", env!("CARGO_PKG_VERSION"), hotkey_text(cfg.hotkey))
 }
 
 // --------------------------------------------------------------- wndprocs
@@ -266,6 +274,38 @@ unsafe extern "system" fn ctrl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
     match msg {
         WM_HOTKEY if wp as i32 == HOTKEY_ID => {
             toggle();
+            0
+        }
+        WM_TIMER if wp == TIMER_CHECK => {
+            KillTimer(hwnd, TIMER_CHECK);
+            UPDATE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+            updater::spawn_check(hwnd);
+            0
+        }
+        // The checker hit a network error: schedule the next attempt, if any is left.
+        updater::WM_UPDATE_FAILED => {
+            schedule_update_check();
+            0
+        }
+        updater::WM_UPDATE_READY | WM_TIMER => {
+            KillTimer(hwnd, TIMER_INSTALL);
+            // Never interrupt a drawing or an open settings window: retry in a minute.
+            let busy = settings::hwnd().is_some() || with_app(|a| a.overlay.is_some()).unwrap_or(true);
+            if busy {
+                SetTimer(hwnd, TIMER_INSTALL, 60_000, None);
+            } else if let Some(path) = updater::installer() {
+                // The installer closes this process anyway; exit right away so it does not wait.
+                if updater::run_installer(&path) {
+                    DestroyWindow(hwnd);
+                }
+            }
+            0
+        }
+        // Windows is shutting down, or an installer asked us to close (Restart Manager).
+        WM_ENDSESSION => {
+            if wp != 0 {
+                DestroyWindow(hwnd);
+            }
             0
         }
         WM_APP_HIDE | WM_DISPLAYCHANGE => {
@@ -414,7 +454,21 @@ fn error_box(text: &str) {
     unsafe { MessageBoxW(null_mut(), t.as_ptr(), c.as_ptr(), MB_OK | MB_ICONERROR) };
 }
 
+/// Arms the timer for the next update check, or does nothing when all attempts are used.
+fn schedule_update_check() {
+    let n = UPDATE_ATTEMPTS.load(Ordering::Relaxed);
+    if let Some(&delay) = updater::ATTEMPT_DELAYS_MS.get(n) {
+        unsafe { SetTimer(ctrl(), TIMER_CHECK, delay, None) };
+    }
+}
+
 fn main() {
+    // One-shot update checker child process: no window, tray or single-instance lock.
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() == Some(std::ffi::OsStr::new(updater::CHECK_ARG)) {
+        return updater::run_check(args.next().as_deref());
+    }
+
     unsafe {
         // Single instance: a second launch just tells the user and exits.
         let mutex_name = wide("Local\\PencilSingleInstance");
@@ -481,6 +535,11 @@ fn main() {
         });
         let tray = Tray::new(hwnd, &tray_tip(&config));
         with_app(|a| a.tray = tray);
+
+        // Check for a newer release (installed copies only, once per start).
+        if updater::enabled() {
+            schedule_update_check();
+        }
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
