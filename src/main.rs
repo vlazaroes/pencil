@@ -34,6 +34,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapCompact};
+use windows_sys::Win32::UI::Controls::{LoadIconMetric, LIM_SMALL};
 use windows_sys::Win32::UI::Input::Ime::ImmDisableIME;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::HiDpi::{
@@ -50,7 +51,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use config::{hotkey_text, Config, Hotkey};
 use overlay::{Effect, Overlay};
-use raster::{Rgb, Surface};
 
 const HOTKEY_ID: i32 = 1;
 
@@ -258,9 +258,6 @@ pub fn apply_settings(cfg: Config) -> bool {
     with_app(|a| {
         a.config = cfg;
         a.hotkey_active = true;
-        if let Some(t) = a.tray.as_mut() {
-            t.set_tip(&tray_tip(&cfg));
-        }
     });
     true
 }
@@ -286,8 +283,25 @@ fn hotkey_taken_text(h: Hotkey) -> String {
     )
 }
 
-fn tray_tip(cfg: &Config) -> String {
-    format!("Pencil {} ({})", env!("CARGO_PKG_VERSION"), hotkey_text(cfg.hotkey))
+/// Tray tooltip: just the app name and version.
+fn tray_tip() -> String {
+    format!("Pencil {}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Resource id of the app icon embedded by build.rs: MAKEINTRESOURCE(1), an
+/// integer passed where Windows expects a name pointer.
+const APP_ICON: *const u16 = std::ptr::without_provenance(1);
+
+/// Large and small app icons for window classes. Shared (LR_SHARED): Windows owns
+/// them, so they are never destroyed by the app.
+pub fn class_icons() -> (HICON, HICON) {
+    unsafe {
+        let hinst = GetModuleHandleW(null_mut());
+        let big = LoadImageW(hinst, APP_ICON, IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
+        let (cx, cy) = (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+        let small = LoadImageW(hinst, APP_ICON, IMAGE_ICON, cx, cy, LR_SHARED);
+        (big, small)
+    }
 }
 
 // --------------------------------------------------------------- wndprocs
@@ -419,8 +433,7 @@ unsafe extern "system" fn ctrl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             // Explorer restarted: the icon has to be added again.
             let old = with_app(|a| a.tray.take()).flatten();
             drop(old);
-            let tip = with_app(|a| tray_tip(&a.config)).unwrap_or_default();
-            let t = Tray::new(hwnd, &tip);
+            let t = Tray::new(hwnd, &tray_tip());
             with_app(|a| a.tray = t);
             0
         }
@@ -467,7 +480,9 @@ struct Tray {
 impl Tray {
     fn new(hwnd: HWND, tip: &str) -> Option<Tray> {
         unsafe {
-            let icon = make_icon();
+            // Small icon at the size the notification area uses for the current DPI.
+            let mut icon: HICON = null_mut();
+            LoadIconMetric(GetModuleHandleW(null_mut()), APP_ICON, LIM_SMALL, &mut icon);
             let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
             nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
             nid.hWnd = hwnd;
@@ -490,11 +505,6 @@ impl Tray {
         let t: Vec<u16> = tip.encode_utf16().take(self.nid.szTip.len() - 1).collect();
         self.nid.szTip.fill(0);
         self.nid.szTip[..t.len()].copy_from_slice(&t);
-    }
-
-    fn set_tip(&mut self, tip: &str) {
-        self.write_tip(tip);
-        unsafe { Shell_NotifyIconW(NIM_MODIFY, &self.nid) };
     }
 
     /// Shows a notification from the tray icon (a toast on Windows 10/11). Works on a
@@ -524,29 +534,6 @@ impl Drop for Tray {
             }
         }
     }
-}
-
-/// Builds the tray icon (blue circle with a white pencil) without external resources.
-unsafe fn make_icon() -> HICON {
-    let sz = GetSystemMetrics(SM_CXSMICON).clamp(16, 64);
-    let Some(mut dib) = gdi::Dib::new(sz, sz, false) else { return null_mut() };
-    {
-        let mut sf: Surface = dib.surface();
-        sf.fill(0);
-        let f = sz as f32;
-        sf.circle(f * 0.5, f * 0.5, f * 0.5 - 0.5, Rgb(0x1E, 0x6F, 0xE8));
-        sf.capsule((f * 0.32, f * 0.68), (f * 0.70, f * 0.30), f * 0.09, Rgb(255, 255, 255));
-    }
-    // Zeroed monochrome mask (rows aligned to 16 bits); ignored with 32 bpp alpha.
-    let mask_bits = vec![0u8; (((sz + 15) / 16) * 2 * sz) as usize];
-    let mask = windows_sys::Win32::Graphics::Gdi::CreateBitmap(sz, sz, 1, 1, mask_bits.as_ptr().cast());
-    if mask.is_null() {
-        return null_mut();
-    }
-    let ii = ICONINFO { fIcon: 1, xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: dib.bmp };
-    let icon = CreateIconIndirect(&ii); // copies the bitmaps
-    windows_sys::Win32::Graphics::Gdi::DeleteObject(mask);
-    icon
 }
 
 // --------------------------------------------------------------- main
@@ -601,6 +588,7 @@ fn main() {
         let mut wc: WNDCLASSEXW = std::mem::zeroed();
         wc.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
         wc.hInstance = hinst;
+        (wc.hIcon, wc.hIconSm) = class_icons();
         wc.lpfnWndProc = Some(ctrl_proc);
         wc.lpszClassName = ctrl_class.as_ptr();
         if RegisterClassExW(&wc) == 0 {
@@ -645,7 +633,7 @@ fn main() {
                 last_shot: None,
             })
         });
-        let tray = Tray::new(hwnd, &tray_tip(&config));
+        let tray = Tray::new(hwnd, &tray_tip());
         with_app(|a| a.tray = tray);
 
         // Check for a newer release (installed copies only, once per start).

@@ -92,6 +92,7 @@ pub fn register_class(hinst: HINSTANCE) -> bool {
         let mut wc: WNDCLASSEXW = std::mem::zeroed();
         wc.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
         wc.hInstance = hinst;
+        (wc.hIcon, wc.hIconSm) = crate::class_icons();
         wc.lpfnWndProc = Some(settings_proc);
         wc.lpszClassName = class.as_ptr();
         wc.hCursor = LoadCursorW(null_mut(), IDC_ARROW);
