@@ -18,7 +18,8 @@ use std::ptr::null_mut;
 use std::sync::Mutex;
 
 use miniz_oxide::deflate::core::{compress, create_comp_flags_from_zip_params, CompressorOxide, TDEFLFlush, TDEFLStatus};
-use windows_sys::Win32::Foundation::{HINSTANCE, HWND, SYSTEMTIME};
+use windows_sys::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, RECT, SYSTEMTIME};
+use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows_sys::Win32::Graphics::Gdi::{
     BitBlt, CombineRgn, CreateCompatibleBitmap, CreateCompatibleDC, CreateRectRgn, DeleteDC,
     DeleteObject, GetDC, GetStockObject, ReleaseDC, SelectObject, SetWindowRgn, BLACK_BRUSH,
@@ -26,6 +27,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::config::read_reg_sz;
@@ -122,6 +124,57 @@ impl Drop for Veil {
     fn drop(&mut self) {
         unsafe { DestroyWindow(self.hwnd) };
     }
+}
+
+// ---------------------------------------------------------------- windows
+
+/// Visible bounds (screen coordinates) of the top-level windows a user can point
+/// at, topmost first. The overlay covers the whole screen, so the window under the
+/// cursor cannot be asked to Windows directly: callers hit-test this snapshot.
+///
+/// Skipped: Pencil's own windows, hidden, minimized and cloaked ones (other
+/// virtual desktops, suspended apps), click-through overlays, and the desktop
+/// itself (pointing at it means "the whole monitor").
+pub fn visible_windows() -> Vec<RECT> {
+    let mut out: Vec<RECT> = Vec::new();
+    unsafe { EnumWindows(Some(collect_window), &mut out as *mut Vec<RECT> as LPARAM) };
+    out
+}
+
+unsafe extern "system" fn collect_window(hwnd: HWND, lp: LPARAM) -> BOOL {
+    let out = &mut *(lp as *mut Vec<RECT>);
+    if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+        return 1;
+    }
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, &mut pid);
+    if pid == GetCurrentProcessId() {
+        return 1;
+    }
+    if GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT != 0 {
+        return 1;
+    }
+    let mut cloaked = 0u32;
+    let attr = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED as u32, (&mut cloaked as *mut u32).cast(), 4);
+    if attr == 0 && cloaked != 0 {
+        return 1;
+    }
+    let mut class = [0u16; 16];
+    let n = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32).max(0) as usize;
+    let class = String::from_utf16_lossy(&class[..n]);
+    if class == "Progman" || class == "WorkerW" {
+        return 1;
+    }
+    // The bounds DWM draws, without the invisible resize borders and shadow.
+    let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    let size = std::mem::size_of::<RECT>() as u32;
+    if DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS as u32, (&mut r as *mut RECT).cast(), size) != 0 {
+        GetWindowRect(hwnd, &mut r);
+    }
+    if r.right > r.left && r.bottom > r.top {
+        out.push(r);
+    }
+    1
 }
 
 // ---------------------------------------------------------------- grab

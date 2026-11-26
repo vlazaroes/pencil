@@ -22,11 +22,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, GetCursorPos, GetSystemMetrics, KillTimer, SetTimer,
     UpdateLayeredWindowIndirect, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, WM_TIMER,
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    UPDATELAYEREDWINDOWINFO, ULW_ALPHA, WM_CAPTURECHANGED, WM_KEYDOWN, WM_LBUTTONDOWN,
+    UPDATELAYEREDWINDOWINFO, ULW_ALPHA, WM_CAPTURECHANGED, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MOUSEMOVE, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
-use crate::capture::{Image, Veil};
+use crate::capture::{self, Image, Veil};
 use crate::config::{Config, Keys, ThemePref};
 use crate::gdi::Dib;
 use crate::raster::{blend, sd_round_rect, Rect, Rgb, Surface};
@@ -145,7 +145,12 @@ enum Shot {
     Armed,
     /// Dragging from `start` to `cur` (client coordinates).
     Dragging { start: (i32, i32), cur: (i32, i32) },
+    /// Ctrl held: pointing at windows; `target` is the one a click would capture.
+    Window { target: Rect },
 }
+
+/// `MK_CONTROL` in the wParam of mouse messages: Ctrl is down.
+const MK_CONTROL: usize = 0x0008;
 
 /// Selections smaller than this (in pixels) in both directions count as a click,
 /// which captures the whole monitor.
@@ -277,6 +282,8 @@ pub struct Overlay {
     veil: Option<Veil>,
     /// Finished selection waiting for `screenshot()`.
     pending_shot: Option<Rect>,
+    /// Window bounds (client coordinates, topmost first) while pointing at windows.
+    windows: Vec<Rect>,
     notice: Option<Notice>,
 }
 
@@ -342,6 +349,7 @@ impl Overlay {
             shot: Shot::Off,
             veil: None,
             pending_shot: None,
+            windows: Vec::new(),
             notice: None,
         };
         ov.dib.surface().fill(BG);
@@ -362,7 +370,16 @@ impl Overlay {
         let mut fx = Effect::None;
         match msg {
             WM_MOUSEMOVE => {
-                if let Shot::Dragging { start, .. } = self.shot {
+                // Ctrl state rides on every mouse message, so the window mode stays in
+                // sync even if a key event was missed (e.g. Ctrl pressed before arming).
+                self.sync_window_mode(wp & MK_CONTROL != 0, x, y);
+                if let Shot::Window { target } = self.shot {
+                    let t = self.window_at(x, y);
+                    if t != target {
+                        self.set_shot(Shot::Window { target: t });
+                    }
+                    self.set_hover(self.hit(x, y));
+                } else if let Shot::Dragging { start, .. } = self.shot {
                     self.shot = Shot::Dragging { start, cur: (x, y) };
                     if let Some(v) = &self.veil {
                         v.set_hole(Some(self.selection(start, (x, y))));
@@ -377,6 +394,14 @@ impl Overlay {
             }
             WM_LBUTTONDOWN => match self.hit(x, y) {
                 Some(b) => self.pressed = Some(b),
+                // Pointing at windows: a click captures the highlighted one (no dragging).
+                None if matches!(self.shot, Shot::Window { .. }) => {
+                    if let Shot::Window { target } = self.shot {
+                        self.pending_shot = Some(target);
+                        self.set_shot(Shot::Off);
+                        fx = Effect::Screenshot;
+                    }
+                }
                 None if self.shot == Shot::Armed => {
                     self.shot = Shot::Dragging { start: (x, y), cur: (x, y) };
                     self.set_hover(None);
@@ -427,6 +452,10 @@ impl Overlay {
                 }
             }
             WM_KEYDOWN => fx = self.key(wp as u16, lp),
+            WM_KEYUP if wp as u16 == VK_CONTROL => {
+                let (cx, cy) = self.cursor_client();
+                self.sync_window_mode(false, cx, cy);
+            }
             WM_TIMER if wp == NOTICE_TIMER => self.set_notice(None),
             _ => {}
         }
@@ -462,6 +491,13 @@ impl Overlay {
             return Effect::Hide;
         }
         let repeat = (lp >> 30) & 1 != 0;
+        if vk == VK_CONTROL {
+            if !repeat {
+                let (cx, cy) = self.cursor_client();
+                self.sync_window_mode(true, cx, cy);
+            }
+            return Effect::None;
+        }
         let mods = unsafe { GetKeyState(VK_CONTROL as i32) < 0 || GetKeyState(VK_MENU as i32) < 0 };
         if repeat || mods {
             return Effect::None; // keeps the global hotkey itself from triggering actions
@@ -527,6 +563,9 @@ impl Overlay {
         if shot != Shot::Off && self.hover != Some(Btn::Capture) {
             self.hover = None;
         }
+        if !matches!(shot, Shot::Window { .. }) {
+            self.windows = Vec::new(); // free the snapshot
+        }
         match shot {
             Shot::Off => self.veil = None,
             _ if was_off => {
@@ -534,13 +573,49 @@ impl Overlay {
             }
             _ => {
                 if let Some(v) = &self.veil {
-                    v.set_hole(None);
+                    // The highlighted window shows through; otherwise all is dimmed.
+                    let hole = if let Shot::Window { target } = shot { Some(target) } else { None };
+                    v.set_hole(hole);
                 }
             }
         }
         if was_off != (shot == Shot::Off) {
             self.draw_menu(); // the highlighted tool changes
         }
+    }
+
+    /// Enters (Ctrl down, while armed) or leaves (Ctrl up) the window pointing mode.
+    /// Never during a drag: then Ctrl is simply ignored.
+    fn sync_window_mode(&mut self, ctrl: bool, x: i32, y: i32) {
+        match (ctrl, self.shot) {
+            (true, Shot::Armed) => {
+                // Windows do not move while the overlay covers the screen: one
+                // snapshot per Ctrl press makes hit-testing on mouse move trivial.
+                let (ox, oy) = self.origin;
+                let screen = Rect::new(0, 0, self.dib.w, self.dib.h);
+                self.windows = capture::visible_windows()
+                    .into_iter()
+                    .map(|r| Rect::new(r.left - ox, r.top - oy, r.right - ox, r.bottom - oy).intersect(&screen))
+                    .filter(|r| !r.is_empty())
+                    .collect();
+                let target = self.window_at(x, y);
+                self.set_shot(Shot::Window { target });
+            }
+            (false, Shot::Window { .. }) => self.set_shot(Shot::Armed),
+            _ => {}
+        }
+    }
+
+    /// Topmost window under the client point, or its whole monitor (desktop).
+    fn window_at(&self, x: i32, y: i32) -> Rect {
+        self.windows.iter().find(|r| r.contains(x, y)).copied().unwrap_or_else(|| self.monitor_rect(x, y))
+    }
+
+    /// Cursor position in client coordinates.
+    fn cursor_client(&self) -> (i32, i32) {
+        let mut pt = POINT { x: 0, y: 0 };
+        unsafe { GetCursorPos(&mut pt) };
+        (pt.x - self.origin.0, pt.y - self.origin.1)
     }
 
     /// Full area of the monitor containing the client point, in client coordinates.

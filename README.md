@@ -41,7 +41,9 @@ Default shortcuts (all but the fixed ones can be changed in *Settings*):
 ## Screenshots
 
 Press the camera button (or `C`), then drag over the area to capture, or just
-click to capture the whole monitor under the pointer. The image
+click to capture the whole monitor under the pointer. Hold `Ctrl` to point at
+windows instead: the one under the pointer is highlighted and a click captures
+it. The image
 keeps your drawings but never the toolbar. A shutter sound plays, and the image is copied to the clipboard and
 saved as a PNG in `Pictures\Pencil`; a notice above the toolbar confirms it
 (click it to open the image). You can keep drawing afterwards.
