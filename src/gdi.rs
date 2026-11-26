@@ -58,6 +58,23 @@ impl Dib {
         }
     }
 
+    /// Releases the memory DC, keeping only the bitmap (e.g. to hand it to another thread).
+    pub fn drop_dc(&mut self) {
+        if !self.dc.is_null() {
+            unsafe {
+                SelectObject(self.dc, self.old);
+                DeleteDC(self.dc);
+            }
+            self.dc = null_mut();
+        }
+    }
+
+    /// Read-only view of the pixels.
+    pub fn pixels(&self) -> &[u32] {
+        // SAFETY: as in `surface`; a shared borrow only allows reads.
+        unsafe { std::slice::from_raw_parts(self.bits, self.w as usize * self.h as usize) }
+    }
+
     /// Drawing surface over the whole bitmap (global origin at 0,0).
     pub fn surface(&mut self) -> Surface<'_> {
         let len = self.w as usize * self.h as usize;

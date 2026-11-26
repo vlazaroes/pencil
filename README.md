@@ -35,13 +35,22 @@ Default shortcuts (all but the fixed ones can be changed in *Settings*):
 | Size (4 presets, 2nd by default) | click the dot, `S` |
 | Clear everything | eraser, `E`, `Del` and `Backspace` (fixed) |
 | Size presets | `1`–`4` (fixed) |
+| Screenshot of an area | camera button, `C` (`Esc` cancels the selection) |
 | Close overlay | X, `Esc` (fixed), `Alt+F4`, or the global hotkey |
+
+## Screenshots
+
+Press the camera button (or `C`), then drag over the area to capture, or just
+click to capture the whole monitor under the pointer. The image
+keeps your drawings but never the toolbar. A shutter sound plays, and the image is copied to the clipboard and
+saved as a PNG in `Pictures\Pencil`; a notice above the toolbar confirms it
+(click it to open the image). You can keep drawing afterwards.
 
 ## Settings
 
 Right click the tray icon → *Settings* opens a small native window to change the
-show/hide hotkey (must include Ctrl or Alt), the pencil/size/clear keys, and the
-toolbar theme (System, Light or Dark; System follows the Windows app mode).
+show/hide hotkey (must include Ctrl or Alt), the color/size/erase/capture keys, and
+the toolbar theme (System, Light or Dark; System follows the Windows app mode).
 Settings are stored under `HKCU\Software\Pencil`.
 
 The overlay also closes by itself if it loses focus (Alt+Tab, Windows key,

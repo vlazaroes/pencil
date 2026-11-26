@@ -168,7 +168,7 @@ impl<'a> Surface<'a> {
 
 /// `src over dst` blend in premultiplied ARGB; `a` is the coverage 0..=255.
 #[inline]
-fn blend(dst: u32, c: Rgb, a: u32) -> u32 {
+pub fn blend(dst: u32, c: Rgb, a: u32) -> u32 {
     let (r, g, b) = (c.0 as u32, c.1 as u32, c.2 as u32);
     if a >= 255 {
         return 0xFF00_0000 | (r << 16) | (g << 8) | b;
@@ -194,7 +194,7 @@ fn sd_segment(px: f32, py: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
 
 /// Rounded-rectangle SDF centered at the origin.
 #[inline]
-fn sd_round_rect(px: f32, py: f32, hw: f32, hh: f32, r: f32) -> f32 {
+pub fn sd_round_rect(px: f32, py: f32, hw: f32, hh: f32, r: f32) -> f32 {
     let qx = px.abs() - (hw - r);
     let qy = py.abs() - (hh - r);
     let ox = qx.max(0.0);

@@ -15,11 +15,13 @@
 
 #![windows_subsystem = "windows"]
 
+mod capture;
 mod config;
 mod gdi;
 mod overlay;
 mod raster;
 mod settings;
+mod sound;
 mod updater;
 
 use std::cell::RefCell;
@@ -31,6 +33,8 @@ use windows_sys::Win32::Foundation::{
     WPARAM,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapCompact};
+use windows_sys::Win32::UI::Input::Ime::ImmDisableIME;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -39,8 +43,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, ReleaseCapture, SetCapture, UnregisterHotKey, MOD_NOREPEAT,
 };
 use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO,
+    NIIF_NOSOUND, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -57,6 +61,10 @@ const DEFAULT_SIZE: usize = 1;
 const WM_APP_HIDE: u32 = WM_APP + 1;
 const WM_APP_TRAY: u32 = WM_APP + 2;
 // WM_APP + 3 and + 4 are used by the update checker (see updater.rs).
+/// A background PNG save finished (see capture.rs).
+const WM_APP_SHOT_SAVED: u32 = WM_APP + 5;
+/// Tray notification clicked (shell `NIN_BALLOONUSERCLICK`).
+const NIN_BALLOONUSERCLICK: u32 = WM_USER + 5;
 /// Retry timer for an update that arrived while the user was busy.
 const TIMER_INSTALL: usize = 1;
 /// Timer that launches the next update check.
@@ -83,6 +91,8 @@ struct App {
     /// Color and size remembered between activations.
     color: usize,
     size: usize,
+    /// Last saved screenshot, opened when its notification is clicked.
+    last_shot: Option<std::path::PathBuf>,
 }
 
 thread_local! {
@@ -147,7 +157,12 @@ fn hide() {
         Err(_) => Err(()),
     });
     match taken {
-        Ok(ov) => drop(ov),
+        Ok(ov) => {
+            if ov.is_some() {
+                drop(ov);
+                trim_heap();
+            }
+        }
         // State busy: retry as soon as the message loop comes back.
         Err(()) => post_hide(),
     }
@@ -159,6 +174,61 @@ fn toggle() {
         Some(false) => show(),
         None => post_hide(),
     }
+}
+
+// --------------------------------------------------------------- screenshots
+
+/// Grabs the finished selection, copies it right away and saves the PNG in the
+/// background; the notice comes when the file is written.
+fn take_screenshot() {
+    let Some(mut img) = with_app(|a| a.overlay.as_mut().and_then(|o| o.screenshot())).flatten() else {
+        return;
+    };
+    sound::shutter();
+    let copied = capture::to_clipboard(ctrl(), &mut img);
+    capture::save_async(img, copied, ctrl(), WM_APP_SHOT_SAVED);
+}
+
+/// Tells the user how a screenshot went: in the overlay if it is still open
+/// (Windows mutes its own notifications while a full-screen window is in front),
+/// otherwise with a tray notification.
+fn shot_saved(saved: capture::Saved) {
+    let ok = saved.copied && saved.path.is_some();
+    let text = match (saved.copied, saved.path.is_some()) {
+        (true, true) => "Copied to clipboard \u{b7} Saved to Pictures\\Pencil",
+        (true, false) => "Copied to clipboard \u{b7} Could not save the PNG",
+        (false, true) => "Could not copy to clipboard \u{b7} Saved to Pictures\\Pencil",
+        (false, false) => "Could not copy or save the screenshot",
+    };
+    let shown = with_app(|a| {
+        a.last_shot = saved.path;
+        a.overlay.as_mut().map(|o| o.notify(ok, text)).is_some()
+    })
+    .unwrap_or(false);
+    if !shown {
+        notify("Pencil screenshot", text);
+    }
+}
+
+/// Opens the image with its default app. Done through explorer.exe so the shell's
+/// file association machinery (several MB) is never loaded into this process.
+fn open_last_shot() {
+    let Some(Some(path)) = with_app(|a| a.last_shot.clone()) else { return };
+    let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
+}
+
+/// Gives freed heap memory back to the system. Large one-off work (a screenshot,
+/// the overlay) leaves free blocks committed otherwise.
+fn trim_heap() {
+    unsafe { HeapCompact(GetProcessHeap(), 0) };
+}
+
+fn notify(title: &str, text: &str) {
+    with_app(|a| {
+        if let Some(t) = a.tray.as_ref() {
+            t.notify(title, text);
+        }
+    });
 }
 
 // --------------------------------------------------------------- settings
@@ -247,7 +317,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             SetCursor(LoadCursorW(null_mut(), if hand { IDC_HAND } else { IDC_CROSS }));
             1
         }
-        WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_CAPTURECHANGED | WM_KEYDOWN => {
+        WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_CAPTURECHANGED | WM_KEYDOWN | WM_TIMER => {
             let fx = with_app(|a| match a.overlay.as_mut() {
                 Some(o) if o.hwnd == hwnd => o.handle(msg, wp, lp),
                 _ => Effect::None,
@@ -256,11 +326,20 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             // Effects that send synchronous messages: always without an active borrow.
             match fx {
                 Effect::None => {}
-                Effect::Capture => {
+                Effect::MouseCapture => {
                     SetCapture(hwnd);
                 }
-                Effect::Release => {
+                Effect::MouseRelease => {
                     ReleaseCapture();
+                }
+                Effect::Screenshot => {
+                    ReleaseCapture();
+                    take_screenshot();
+                }
+                // Clicking the notice leaves drawing mode and shows the image.
+                Effect::OpenShot => {
+                    hide();
+                    open_last_shot();
                 }
                 Effect::Hide => hide(),
             }
@@ -312,9 +391,17 @@ unsafe extern "system" fn ctrl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             hide();
             0
         }
+        WM_APP_SHOT_SAVED => {
+            for saved in capture::take_saved() {
+                shot_saved(saved);
+            }
+            trim_heap();
+            0
+        }
         WM_APP_TRAY => {
             match (lp & 0xFFFF) as u32 {
                 WM_LBUTTONUP => show(),
+                NIN_BALLOONUSERCLICK => open_last_shot(),
                 WM_RBUTTONUP | WM_CONTEXTMENU => tray_menu(hwnd),
                 _ => {}
             }
@@ -409,6 +496,22 @@ impl Tray {
         self.write_tip(tip);
         unsafe { Shell_NotifyIconW(NIM_MODIFY, &self.nid) };
     }
+
+    /// Shows a notification from the tray icon (a toast on Windows 10/11). Works on a
+    /// copy so later tooltip updates do not show it again.
+    fn notify(&self, title: &str, text: &str) {
+        let mut nid = self.nid;
+        nid.uFlags = NIF_INFO;
+        let copy = |dst: &mut [u16], s: &str| {
+            let v: Vec<u16> = s.encode_utf16().take(dst.len() - 1).collect();
+            dst.fill(0);
+            dst[..v.len()].copy_from_slice(&v);
+        };
+        copy(&mut nid.szInfoTitle, title);
+        copy(&mut nid.szInfo, text);
+        nid.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
+        unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) };
+    }
 }
 
 impl Drop for Tray {
@@ -463,13 +566,21 @@ fn schedule_update_check() {
 }
 
 fn main() {
-    // One-shot update checker child process: no window, tray or single-instance lock.
+    // One-shot helper child processes: no window, tray or single-instance lock.
     let mut args = std::env::args_os().skip(1);
-    if args.next().as_deref() == Some(std::ffi::OsStr::new(updater::CHECK_ARG)) {
+    let arg = args.next();
+    if arg.as_deref() == Some(std::ffi::OsStr::new(updater::CHECK_ARG)) {
         return updater::run_check(args.next().as_deref());
+    }
+    if arg.as_deref() == Some(std::ffi::OsStr::new(sound::PLAY_ARG)) {
+        return sound::play_and_exit();
     }
 
     unsafe {
+        // Pencil never takes text input, so keep the IME / Text Services Framework
+        // out of the process (it would load as soon as a window gets keyboard focus).
+        ImmDisableIME(u32::MAX);
+
         // Single instance: a second launch just tells the user and exits.
         let mutex_name = wide("Local\\PencilSingleInstance");
         let mutex = CreateMutexW(null_mut(), 0, mutex_name.as_ptr());
@@ -497,7 +608,7 @@ fn main() {
         }
         wc.lpfnWndProc = Some(overlay_proc);
         wc.lpszClassName = overlay_class.as_ptr();
-        if RegisterClassExW(&wc) == 0 || !settings::register_class(hinst) {
+        if RegisterClassExW(&wc) == 0 || !settings::register_class(hinst) || !capture::register_class(hinst) {
             return error_box("Could not register the window class.");
         }
 
@@ -531,6 +642,7 @@ fn main() {
                 hotkey_active,
                 color: DEFAULT_COLOR,
                 size: DEFAULT_SIZE,
+                last_shot: None,
             })
         });
         let tray = Tray::new(hwnd, &tray_tip(&config));

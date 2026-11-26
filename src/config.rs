@@ -96,19 +96,18 @@ pub struct Keys {
     pub pencil: u16,
     pub size: u16,
     pub clear: u16,
+    pub capture: u16,
 }
 
 impl Keys {
-    pub fn all(&self) -> [u16; 3] {
-        [self.pencil, self.size, self.clear]
+    pub fn all(&self) -> [u16; 4] {
+        [self.pencil, self.size, self.clear, self.capture]
     }
 
     pub fn is_valid(&self) -> bool {
         let k = self.all();
-        k.iter().all(|&v| v != 0 && v <= 0xFE && !is_reserved(v))
-            && k[0] != k[1]
-            && k[0] != k[2]
-            && k[1] != k[2]
+        let distinct = (0..k.len()).all(|i| !k[i + 1..].contains(&k[i]));
+        distinct && k.iter().all(|&v| v != 0 && v <= 0xFE && !is_reserved(v))
     }
 }
 
@@ -123,7 +122,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             hotkey: Hotkey { mods: MOD_CONTROL | MOD_ALT, vk: b'D' as u32 },
-            keys: Keys { pencil: b'P' as u16, size: b'S' as u16, clear: b'E' as u16 },
+            keys: Keys { pencil: b'P' as u16, size: b'S' as u16, clear: b'E' as u16, capture: b'C' as u16 },
             theme: ThemePref::System,
         }
     }
@@ -139,7 +138,9 @@ impl Config {
             .unwrap_or(d.hotkey);
         let keys = match (read("PencilKey"), read("SizeKey"), read("ClearKey")) {
             (Some(p), Some(s), Some(c)) => {
-                Some(Keys { pencil: p as u16, size: s as u16, clear: c as u16 }).filter(Keys::is_valid)
+                // Settings saved before the capture key existed get its default.
+                let capture = read("CaptureKey").map_or(d.keys.capture, |v| v as u16);
+                Some(Keys { pencil: p as u16, size: s as u16, clear: c as u16, capture }).filter(Keys::is_valid)
             }
             _ => None,
         }
@@ -153,8 +154,34 @@ impl Config {
         write("PencilKey", self.keys.pencil as u32);
         write("SizeKey", self.keys.size as u32);
         write("ClearKey", self.keys.clear as u32);
+        write("CaptureKey", self.keys.capture as u32);
         write("Theme", self.theme as u32);
     }
+}
+
+/// Reads a string value under HKEY_CURRENT_USER; REG_EXPAND_SZ values come back
+/// with their environment variables expanded.
+pub fn read_reg_sz(key: &str, name: &str) -> Option<String> {
+    let key = wide(key);
+    let name = wide(name);
+    let mut buf = [0u16; 1024];
+    let mut len = std::mem::size_of_val(&buf) as u32;
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let n = (len as usize / 2).saturating_sub(1); // bytes -> chars, minus the terminator
+    Some(String::from_utf16_lossy(&buf[..n]))
 }
 
 fn read(name: &str) -> Option<u32> {
