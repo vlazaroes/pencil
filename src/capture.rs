@@ -18,7 +18,8 @@ use std::ptr::null_mut;
 use std::sync::Mutex;
 
 use miniz_oxide::deflate::core::{compress, create_comp_flags_from_zip_params, CompressorOxide, TDEFLFlush, TDEFLStatus};
-use windows_sys::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, RECT, SYSTEMTIME};
+use windows_sys::core::BOOL;
+use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, RECT, SYSTEMTIME};
 use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows_sys::Win32::Graphics::Gdi::{
     BitBlt, CombineRgn, CreateCompatibleBitmap, CreateCompatibleDC, CreateRectRgn, DeleteDC,
