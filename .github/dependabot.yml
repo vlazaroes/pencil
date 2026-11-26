@@ -1,0 +1,28 @@
+# Weekly dependency updates: Rust crates (Cargo.toml / Cargo.lock) and the
+# GitHub Actions used by the workflows. Minor and patch bumps are grouped into a
+# single pull request per ecosystem to keep the noise low.
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      rust-dependencies:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: ci
+    groups:
+      github-actions:
+        patterns: ["*"]
