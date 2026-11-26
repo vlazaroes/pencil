@@ -317,7 +317,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             SetCursor(LoadCursorW(null_mut(), if hand { IDC_HAND } else { IDC_CROSS }));
             1
         }
-        WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_CAPTURECHANGED | WM_KEYDOWN | WM_TIMER => {
+        WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_CAPTURECHANGED | WM_KEYDOWN | WM_KEYUP | WM_TIMER => {
             let fx = with_app(|a| match a.overlay.as_mut() {
                 Some(o) if o.hwnd == hwnd => o.handle(msg, wp, lp),
                 _ => Effect::None,
