@@ -32,6 +32,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 DisableDirPage=yes
 DisableProgramGroupPage=yes
 DisableReadyPage=yes
+SetupIconFile=..\assets\pencil.ico
 UninstallDisplayIcon={app}\{#AppExe}
 UninstallDisplayName={#AppName}
 OutputDir=Output
