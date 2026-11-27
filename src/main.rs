@@ -51,13 +51,12 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use config::{hotkey_text, Config, Hotkey};
-use overlay::{Effect, Overlay};
+use overlay::{Effect, Overlay, PenState, Tool};
 
 const HOTKEY_ID: i32 = 1;
 
-/// Default pen: red, 2nd size.
-const DEFAULT_COLOR: usize = 1;
-const DEFAULT_SIZE: usize = 1;
+/// Default pen: red pencil, yellow highlighter, 2nd size.
+const DEFAULT_PEN: PenState = PenState { tool: Tool::Pen, color: 1, hl_color: 0, size: 1 };
 
 const WM_APP_HIDE: u32 = WM_APP + 1;
 const WM_APP_TRAY: u32 = WM_APP + 2;
@@ -89,9 +88,8 @@ struct App {
     config: Config,
     /// Whether `config.hotkey` is currently registered.
     hotkey_active: bool,
-    /// Color and size remembered between activations.
-    color: usize,
-    size: usize,
+    /// Tool, colors and size remembered between activations.
+    pen: PenState,
     /// Last saved screenshot, opened when its notification is clicked.
     last_shot: Option<std::path::PathBuf>,
 }
@@ -126,13 +124,13 @@ fn show() {
     if settings::hwnd().is_some() {
         return;
     }
-    let Some(Some((hinst, class, color, size, cfg))) = with_app(|a| {
-        a.overlay.is_none().then_some((a.hinst, a.overlay_class.as_ptr(), a.color, a.size, a.config))
+    let Some(Some((hinst, class, pen, cfg))) = with_app(|a| {
+        a.overlay.is_none().then_some((a.hinst, a.overlay_class.as_ptr(), a.pen, a.config))
     }) else {
         return;
     };
     // Created with no active borrow: CreateWindowEx sends synchronous messages.
-    let Some(ov) = Overlay::new(hinst, class, color, size, &cfg) else { return };
+    let Some(ov) = Overlay::new(hinst, class, pen, &cfg) else { return };
     let hwnd = ov.hwnd;
     if with_app(|a| a.overlay = Some(ov)).is_none() {
         return; // practically impossible; if it happens, `ov` has already been destroyed
@@ -150,8 +148,7 @@ fn hide() {
         Ok(mut g) => Ok(g.as_mut().and_then(|app| {
             let ov = app.overlay.take();
             if let Some(o) = &ov {
-                app.color = o.color;
-                app.size = o.size;
+                app.pen = o.pen();
             }
             ov
         })),
@@ -631,8 +628,7 @@ fn main() {
                 tray: None,
                 config,
                 hotkey_active,
-                color: DEFAULT_COLOR,
-                size: DEFAULT_SIZE,
+                pen: DEFAULT_PEN,
                 last_shot: None,
             })
         });

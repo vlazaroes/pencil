@@ -50,6 +50,32 @@ pub const COLORS: [Rgb; 4] = [
 pub const SIZES: [f32; 4] = [2.0, 4.0, 8.0, 14.0];
 const SIZE_ICON_R: [f32; 4] = [2.0, 3.5, 5.5, 8.0];
 
+/// Highlighter colors: yellow, green, pink, sky blue.
+pub const HL_COLORS: [Rgb; 4] = [Rgb(255, 221, 0), Rgb(80, 220, 70), Rgb(255, 90, 170), Rgb(40, 180, 255)];
+/// Highlighter nib height in logical pixels, one per size preset.
+const HL_SIZES: [f32; 4] = [8.0, 14.0, 22.0, 32.0];
+/// Opacity of the highlighter ink. Within one stroke it never builds up.
+const HL_ALPHA: f32 = 0.4;
+/// Chisel nib: width as a fraction of its height, and its tilt from the vertical
+/// (radians, top leaning right) like a highlighter held in the right hand.
+const NIB_RATIO: f32 = 0.3;
+const NIB_TILT: f32 = 0.35;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Tool {
+    Pen,
+    Highlighter,
+}
+
+/// Drawing tool state, remembered between activations of the overlay.
+#[derive(Clone, Copy)]
+pub struct PenState {
+    pub tool: Tool,
+    pub color: usize,
+    pub hl_color: usize,
+    pub size: usize,
+}
+
 const ERASER_TIP: Rgb = Rgb(242, 139, 130);
 const CLOSE_HOVER: Rgb = Rgb(229, 72, 77);
 const NOTICE_OK: Rgb = Rgb(46, 160, 67);
@@ -124,6 +150,7 @@ fn theme_for(pref: ThemePref) -> &'static Theme {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Btn {
     Pencil,
+    Highlighter,
     Size,
     Clear,
     Capture,
@@ -131,12 +158,12 @@ enum Btn {
     /// The screenshot notice above the toolbar (not part of `BTNS`).
     Notice,
 }
-const BTNS: [Btn; 5] = [Btn::Pencil, Btn::Size, Btn::Clear, Btn::Capture, Btn::Close];
+const BTNS: [Btn; 6] = [Btn::Pencil, Btn::Highlighter, Btn::Size, Btn::Clear, Btn::Capture, Btn::Close];
 /// Buttons inside the main panel (the close button sits apart).
-const MAIN_BTNS: usize = 4;
+const MAIN_BTNS: usize = 5;
 /// The drawing tools come before this index; a vertical separator sets the
 /// screenshot button apart from them.
-const SEP_BEFORE: usize = 3;
+const SEP_BEFORE: usize = 4;
 
 /// Screenshot selection state.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -154,7 +181,7 @@ enum Shot {
 /// pixels, so undoing re-renders the remaining ones instead of storing copies of
 /// the full-screen canvas.
 enum Op {
-    Stroke { color: usize, size: usize, points: Vec<(f32, f32)> },
+    Stroke { tool: Tool, color: usize, size: usize, points: Vec<(f32, f32)> },
     Clear,
 }
 
@@ -187,8 +214,8 @@ struct Layout {
     s: f32,
     main: FRect,
     close: FRect,
-    btn: [FRect; 5],
-    hit: [Rect; 5],
+    btn: [FRect; 6],
+    hit: [Rect; 6],
     /// Vertical separator line before the screenshot button: x, top and bottom.
     sep: (f32, f32, f32),
     /// Toolbar panels: clicks here never draw.
@@ -237,7 +264,7 @@ impl Layout {
         let cl = main.2 + (14.0 * s).round();
         let close = (cl, bottom - h, cl + h, bottom);
 
-        let mut b = [(0.0, 0.0, 0.0, 0.0); 5];
+        let mut b = [(0.0, 0.0, 0.0, 0.0); 6];
         for (i, r) in b.iter_mut().take(MAIN_BTNS).enumerate() {
             let extra = if i >= SEP_BEFORE { sep_room } else { 0.0 };
             let x = main.0 + pad + i as f32 * (btn + gap) + extra;
@@ -278,11 +305,17 @@ pub struct Overlay {
     lay: Layout,
     theme: &'static Theme,
     keys: Keys,
-    pub color: usize,
-    pub size: usize,
+    tool: Tool,
+    color: usize,
+    hl_color: usize,
+    size: usize,
     hover: Option<Btn>,
     pressed: Option<Btn>,
     drawing: bool,
+    /// Coverage (0-255) of the highlighter stroke being painted, one byte per
+    /// screen pixel, so its ink never builds up where the stroke overlaps itself.
+    /// Empty outside a highlighter stroke.
+    mask: Vec<u8>,
     last: (f32, f32),
     /// Undo / redo stacks, oldest first. Freed with the overlay.
     history: Vec<Op>,
@@ -306,7 +339,7 @@ struct Notice {
 }
 
 impl Overlay {
-    pub fn new(hinst: HINSTANCE, class: *const u16, color: usize, size: usize, cfg: &Config) -> Option<Overlay> {
+    pub fn new(hinst: HINSTANCE, class: *const u16, pen: PenState, cfg: &Config) -> Option<Overlay> {
         let (vx, vy, vw, vh) = unsafe {
             (
                 GetSystemMetrics(SM_XVIRTUALSCREEN),
@@ -349,11 +382,14 @@ impl Overlay {
             lay,
             theme: theme_for(cfg.theme),
             keys: cfg.keys,
-            color: color % COLORS.len(),
-            size: size % SIZES.len(),
+            tool: pen.tool,
+            color: pen.color % COLORS.len(),
+            hl_color: pen.hl_color % HL_COLORS.len(),
+            size: pen.size % SIZES.len(),
             hover: None,
             pressed: None,
             drawing: false,
+            mask: Vec::new(),
             history: Vec::new(),
             redo: Vec::new(),
             last: (0.0, 0.0),
@@ -428,7 +464,8 @@ impl Overlay {
                     self.drawing = true;
                     self.last = (x as f32 + 0.5, y as f32 + 0.5);
                     self.paint(self.last, self.last);
-                    self.history.push(Op::Stroke { color: self.color, size: self.size, points: vec![self.last] });
+                    let color = self.tool_color();
+                    self.history.push(Op::Stroke { tool: self.tool, color, size: self.size, points: vec![self.last] });
                     self.redo.clear();
                     self.set_hover(None);
                     fx = Effect::MouseCapture;
@@ -449,6 +486,7 @@ impl Overlay {
                     fx = if self.pending_shot.is_some() { Effect::Screenshot } else { Effect::MouseRelease };
                 } else if self.drawing {
                     self.drawing = false;
+                    self.mask = Vec::new();
                     fx = Effect::MouseRelease;
                 } else if let Some(p) = self.pressed.take() {
                     if self.hit(x, y) == Some(p) {
@@ -465,6 +503,7 @@ impl Overlay {
             // while already holding it) nothing was lost.
             WM_CAPTURECHANGED if lp as HWND != self.hwnd => {
                 self.drawing = false;
+                self.mask = Vec::new();
                 // Lost the mouse mid-selection (e.g. another window took it): start over.
                 if matches!(self.shot, Shot::Dragging { .. }) {
                     self.set_shot(Shot::Armed);
@@ -487,6 +526,19 @@ impl Overlay {
     /// Is the (client) point over something clickable (toolbar button or notice)?
     pub fn over_button(&self, x: i32, y: i32) -> bool {
         self.hit(x, y).is_some()
+    }
+
+    /// Tool, colors and size, to restore them next time.
+    pub fn pen(&self) -> PenState {
+        PenState { tool: self.tool, color: self.color, hl_color: self.hl_color, size: self.size }
+    }
+
+    /// Color index of the current tool.
+    fn tool_color(&self) -> usize {
+        match self.tool {
+            Tool::Pen => self.color,
+            Tool::Highlighter => self.hl_color,
+        }
     }
 
     fn hit(&self, x: i32, y: i32) -> Option<Btn> {
@@ -536,6 +588,7 @@ impl Overlay {
         let k = self.keys;
         match vk {
             v if v == k.pencil => self.press(Btn::Pencil),
+            v if v == k.highlight => self.press(Btn::Highlighter),
             v if v == k.size => self.press(Btn::Size),
             v if v == k.clear => self.press(Btn::Clear),
             v if v == k.capture => self.press(Btn::Capture),
@@ -548,8 +601,20 @@ impl Overlay {
 
     fn press(&mut self, b: Btn) -> Effect {
         match b {
+            // A tool's button selects it; once selected, it cycles its colors.
             Btn::Pencil => {
-                self.color = (self.color + 1) % COLORS.len();
+                if self.tool == Tool::Pen {
+                    self.color = (self.color + 1) % COLORS.len();
+                }
+                self.tool = Tool::Pen;
+                self.draw_menu();
+                Effect::None
+            }
+            Btn::Highlighter => {
+                if self.tool == Tool::Highlighter {
+                    self.hl_color = (self.hl_color + 1) % HL_COLORS.len();
+                }
+                self.tool = Tool::Highlighter;
                 self.draw_menu();
                 Effect::None
             }
@@ -777,8 +842,8 @@ impl Overlay {
     fn redo(&mut self) -> Effect {
         let Some(op) = self.redo.pop() else { return Effect::None };
         match &op {
-            Op::Stroke { color, size, points } => {
-                self.paint_stroke(*color, *size, points);
+            Op::Stroke { tool, color, size, points } => {
+                self.paint_stroke(*tool, *color, *size, points);
                 self.draw_menu();
             }
             Op::Clear => self.clear(),
@@ -794,8 +859,8 @@ impl Overlay {
         let start = self.history.iter().rposition(|op| matches!(op, Op::Clear)).map_or(0, |i| i + 1);
         let ops = std::mem::take(&mut self.history);
         for op in &ops[start..] {
-            if let Op::Stroke { color, size, points } = op {
-                self.paint_stroke(*color, *size, points);
+            if let Op::Stroke { tool, color, size, points } = op {
+                self.paint_stroke(*tool, *color, *size, points);
             }
         }
         self.history = ops;
@@ -804,25 +869,29 @@ impl Overlay {
     }
 
     /// Paints a whole recorded stroke exactly as it was drawn live.
-    fn paint_stroke(&mut self, color: usize, size: usize, points: &[(f32, f32)]) {
+    fn paint_stroke(&mut self, tool: Tool, color: usize, size: usize, points: &[(f32, f32)]) {
         let mut prev = points[0];
-        self.paint_with(color, size, prev, prev);
+        self.paint_with(tool, color, size, prev, prev);
         for &p in &points[1..] {
-            self.paint_with(color, size, prev, p);
+            self.paint_with(tool, color, size, prev, p);
             prev = p;
         }
+        self.mask = Vec::new();
     }
 
-    /// Paints a stroke segment from `a` to `b` with the current pen.
+    /// Paints a stroke segment from `a` to `b` with the current tool.
     fn paint(&mut self, a: (f32, f32), b: (f32, f32)) {
-        self.paint_with(self.color, self.size, a, b);
+        self.paint_with(self.tool, self.tool_color(), self.size, a, b);
         if self.menu_dirty {
             self.draw_menu();
         }
     }
 
     /// Paints a segment; the caller redraws the toolbar if `menu_dirty` was set.
-    fn paint_with(&mut self, color: usize, size: usize, a: (f32, f32), b: (f32, f32)) {
+    fn paint_with(&mut self, tool: Tool, color: usize, size: usize, a: (f32, f32), b: (f32, f32)) {
+        if tool == Tool::Highlighter {
+            return self.highlight(color, size, a, b);
+        }
         let r = (SIZES[size] * self.lay.s * 0.5).max(0.75);
         let c = COLORS[color];
         // Split long segments so the box to scan stays small.
@@ -839,6 +908,68 @@ impl Overlay {
             }
             self.dirty = self.dirty.union(&bounds.intersect(&screen));
         }
+    }
+
+    /// Paints a highlighter segment: the chisel nib swept from `a` to `b`, in
+    /// translucent ink that does not build up where the stroke overlaps itself.
+    fn highlight(&mut self, color: usize, size: usize, a: (f32, f32), b: (f32, f32)) {
+        let (w, h) = (self.dib.w, self.dib.h);
+        if self.mask.is_empty() {
+            self.mask = vec![0; w as usize * h as usize];
+        }
+        // The nib is a tilted rectangle; swept along a segment it covers the convex
+        // hull of its two copies.
+        let half_h = HL_SIZES[size] * self.lay.s * 0.5;
+        let half_w = (half_h * NIB_RATIO).max(0.75);
+        let (sin, cos) = NIB_TILT.sin_cos();
+        let (v, u) = ((sin * half_h, -cos * half_h), (cos * half_w, sin * half_w));
+        let mut corners = Vec::with_capacity(8);
+        for p in [a, b] {
+            for (sv, su) in [(1.0, 1.0), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0)] {
+                corners.push((p.0 + sv * v.0 + su * u.0, p.1 + sv * v.1 + su * u.1));
+            }
+        }
+        let hull = convex_hull(corners);
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for &(x, y) in &hull {
+            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+        }
+        let screen = Rect::new(0, 0, w, h);
+        let bounds = Rect::bounds(x0 - 1.0, y0 - 1.0, x1 + 1.0, y1 + 1.0).intersect(&screen);
+        if bounds.is_empty() {
+            return;
+        }
+
+        let c = HL_COLORS[color];
+        let area = self.lay.area;
+        let cv = self.dib.surface();
+        let mut under_touched = false;
+        for y in bounds.t..bounds.b {
+            for x in bounds.l..bounds.r {
+                let cov = (0.5 - sd_polygon(x as f32 + 0.5, y as f32 + 0.5, &hull)).clamp(0.0, 1.0);
+                let new = (cov * 255.0 + 0.5) as u8;
+                let i = (y * w + x) as usize;
+                let old = self.mask[i];
+                if new <= old {
+                    continue;
+                }
+                self.mask[i] = new;
+                // The pixel already holds the ink at `old` coverage: blending by `k`
+                // takes it to `new` coverage over the same background.
+                let (ao, an) = (HL_ALPHA * old as f32 / 255.0, HL_ALPHA * new as f32 / 255.0);
+                let k = (((1.0 - (1.0 - an) / (1.0 - ao)) * 255.0) + 0.5) as u32;
+                cv.px[i] = blend(cv.px[i], c, k);
+                if area.contains(x, y) {
+                    let j = ((y - area.t) * area.width() + (x - area.l)) as usize;
+                    self.under[j] = blend(self.under[j], c, k);
+                    under_touched = true;
+                }
+            }
+        }
+        if under_touched {
+            self.menu_dirty = true;
+        }
+        self.dirty = self.dirty.union(&bounds);
     }
 
     /// Recomposes the toolbar: restores the strokes beneath it and paints the panel on top.
@@ -864,9 +995,31 @@ impl Overlay {
             let (cx, cy) = ((r.0 + r.2) * 0.5, (r.1 + r.3) * 0.5);
             let hover = self.hover == Some(*b);
             match b {
+                Btn::Highlighter => {
+                    let bg = match (self.shot == Shot::Off && self.tool == Tool::Highlighter, hover) {
+                        (true, false) => Some(t.selected),
+                        (true, true) => Some(t.selected_hover),
+                        (false, true) => Some(t.hover),
+                        (false, false) => None,
+                    };
+                    if let Some(bg) = bg {
+                        cv.round_rect(r.0, r.1, r.2, r.3, 8.0 * s, bg);
+                    }
+                    // Marker leaning like the pencil: body, then a chisel tip in the ink color.
+                    let col = HL_COLORS[self.hl_color];
+                    let u = (std::f32::consts::FRAC_1_SQRT_2, -std::f32::consts::FRAC_1_SQRT_2);
+                    let y = cy - 3.0 * s;
+                    cv.oriented_box((cx + 1.5 * s, y - 1.5 * s), u, 6.5 * s, 3.6 * s, 1.2 * s, t.icon);
+                    cv.oriented_box((cx - 6.0 * s, y + 6.0 * s), u, 2.4 * s, 2.6 * s, 0.6 * s, col);
+                    for (k, kc) in HL_COLORS.iter().enumerate() {
+                        let rad = if k == self.hl_color { 2.6 } else { 1.8 };
+                        let dx = cx + (k as f32 - 1.5) * 7.0 * s;
+                        cv.circle(dx, cy + 13.0 * s, rad * s, *kc);
+                    }
+                }
                 Btn::Pencil => {
-                    // The active tool is highlighted: the pencil unless selecting a screenshot.
-                    let bg = match (self.shot == Shot::Off, hover) {
+                    // The active tool is highlighted unless selecting a screenshot.
+                    let bg = match (self.shot == Shot::Off && self.tool == Tool::Pen, hover) {
                         (true, false) => Some(t.selected),
                         (true, true) => Some(t.selected_hover),
                         (false, true) => Some(t.hover),
@@ -1061,6 +1214,50 @@ fn draw_pill(cv: &mut Surface, n: &Notice) {
             cv.px[i] = blend(cv.px[i], c, a);
         }
     }
+}
+
+/// Convex hull of a set of points (monotone chain), counterclockwise.
+fn convex_hull(mut p: Vec<(f32, f32)>) -> Vec<(f32, f32)> {
+    p.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    let cross = |o: (f32, f32), a: (f32, f32), b: (f32, f32)| (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0);
+    let mut hull: Vec<(f32, f32)> = Vec::with_capacity(p.len() + 1);
+    for pass in 0..2 {
+        let start = hull.len();
+        for &q in &p {
+            while hull.len() >= start + 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], q) <= 0.0 {
+                hull.pop();
+            }
+            hull.push(q);
+        }
+        hull.pop(); // the last point starts the other half
+        if pass == 0 {
+            p.reverse();
+        }
+    }
+    hull
+}
+
+/// Signed distance from a point to a closed polygon, negative inside.
+fn sd_polygon(x: f32, y: f32, v: &[(f32, f32)]) -> f32 {
+    let mut d = f32::MAX;
+    let mut sign = 1.0;
+    let mut j = v.len() - 1;
+    for i in 0..v.len() {
+        let (a, b) = (v[i], v[j]);
+        let e = (b.0 - a.0, b.1 - a.1);
+        let w = (x - a.0, y - a.1);
+        let len2 = e.0 * e.0 + e.1 * e.1;
+        let t = if len2 > 0.0 { ((w.0 * e.0 + w.1 * e.1) / len2).clamp(0.0, 1.0) } else { 0.0 };
+        let q = (w.0 - e.0 * t, w.1 - e.1 * t);
+        d = d.min(q.0 * q.0 + q.1 * q.1);
+        // Crossing count (even-odd rule) decides inside / outside.
+        let c = (y >= a.1, y < b.1, e.0 * w.1 > e.1 * w.0);
+        if (c.0 && c.1 && c.2) || (!c.0 && !c.1 && !c.2) {
+            sign = -sign;
+        }
+        j = i;
+    }
+    sign * d.sqrt()
 }
 
 fn rgb_u32(c: Rgb) -> u32 {
