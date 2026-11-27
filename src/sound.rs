@@ -17,10 +17,7 @@ static SHUTTER: &[u8] = include_bytes!("../assets/screenshot.wav");
 
 /// Main process: plays the shutter sound without blocking.
 pub fn shutter() {
-    if let Ok(exe) = std::env::current_exe() {
-        // The child handle is dropped (closed) right away; the child runs on its own.
-        let _ = std::process::Command::new(exe).arg(PLAY_ARG).spawn();
-    }
+    crate::process::spawn_self(&[PLAY_ARG]);
 }
 
 /// Child process entry point: plays the sound to the end, then returns (and the
