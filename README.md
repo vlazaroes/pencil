@@ -35,6 +35,8 @@ Default shortcuts (all but the fixed ones can be changed in *Settings*):
 | Size (4 presets, 2nd by default) | click the dot, `S` |
 | Clear everything | eraser, `E`, `Del` and `Backspace` (fixed) |
 | Size presets | `1`–`4` (fixed) |
+| Undo (also brings back a cleared drawing) | `Ctrl+Z` (fixed) |
+| Redo | `Ctrl+Y` or `Ctrl+Shift+Z` (fixed) |
 | Screenshot of an area | camera button, `C` (`Esc` cancels the selection) |
 | Close overlay | X, `Esc` (fixed), `Alt+F4`, or the global hotkey |
 
