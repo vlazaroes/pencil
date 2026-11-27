@@ -8,7 +8,8 @@
 //!   * the global hotkey again (works even if the overlay does not have focus),
 //!   * Esc or Alt+F4,
 //!   * the toolbar X button,
-//!   * losing focus (Alt+Tab, Windows key, Ctrl+Alt+Del, session lock...),
+//!   * losing focus (Alt+Tab, Windows key, Ctrl+Alt+Del, session lock...), except
+//!     with the laser on, since then the other windows are meant to be used,
 //!   * a display/monitor configuration change,
 //!   * any panic (`panic = "abort"` profile: the process dies and Windows removes
 //!     its windows).
@@ -18,6 +19,7 @@
 mod capture;
 mod config;
 mod gdi;
+mod laser;
 mod overlay;
 mod process;
 mod raster;
@@ -315,12 +317,32 @@ pub fn class_icons() -> (HICON, HICON) {
 
 // --------------------------------------------------------------- wndprocs
 
+/// Low-level mouse hook, installed only while the laser is on. It runs on this
+/// thread and must return quickly: it only hands the position to the overlay.
+///
+/// # Safety
+/// Only for Windows to call, with the arguments of a WH_MOUSE_LL hook.
+pub unsafe extern "system" fn laser_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 && wp as u32 == WM_MOUSEMOVE {
+        let pt = (*(lp as *const MSLLHOOKSTRUCT)).pt;
+        with_app(|a| {
+            if let Some(o) = a.overlay.as_mut() {
+                o.laser_move(pt.x, pt.y);
+            }
+        });
+    }
+    CallNextHookEx(null_mut(), code, wp, lp)
+}
+
 unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         // Safety net: if the overlay loses focus for any reason, it closes.
         WM_ACTIVATE => {
             if (wp & 0xFFFF) as u32 == WA_INACTIVE {
-                post_hide();
+                let laser = with_app(|a| a.overlay.as_ref().is_some_and(|o| o.laser_on())).unwrap_or(false);
+                if !laser {
+                    post_hide();
+                }
             }
             0
         }
@@ -335,9 +357,16 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             let mut pt = POINT { x: 0, y: 0 };
             GetCursorPos(&mut pt);
             windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
-            let hand = with_app(|a| a.overlay.as_ref().is_some_and(|o| o.over_button(pt.x, pt.y)))
-                .unwrap_or(false);
-            SetCursor(LoadCursorW(null_mut(), if hand { IDC_HAND } else { IDC_CROSS }));
+            let (hand, laser) = with_app(|a| {
+                a.overlay.as_ref().map_or((false, false), |o| (o.over_button(pt.x, pt.y), o.laser_on()))
+            })
+            .unwrap_or((false, false));
+            let cursor = match (hand, laser) {
+                (true, _) => IDC_HAND,
+                (false, true) => IDC_ARROW,
+                (false, false) => IDC_CROSS,
+            };
+            SetCursor(LoadCursorW(null_mut(), cursor));
             1
         }
         WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_CAPTURECHANGED | WM_KEYDOWN | WM_KEYUP | WM_TIMER => {

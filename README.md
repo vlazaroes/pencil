@@ -32,6 +32,7 @@ Default shortcuts (all but the fixed ones can be changed in *Settings*):
 |---|---|
 | Show / hide overlay | **Ctrl + Alt + D** (global) |
 | Pencil: cycle color (blue → red → black → white) | click the pencil, `P` |
+| Laser pointer: a red dot with a fading trail; meanwhile the PC works as usual (clicks go through) and the pencil goes back to drawing | laser button, `L` |
 | Size (4 presets, 2nd by default) | click the dot, `S` |
 | Clear everything | eraser, `E`, `Del` and `Backspace` (fixed) |
 | Undo (also brings back a cleared drawing) | `Ctrl+Z` (fixed) |
