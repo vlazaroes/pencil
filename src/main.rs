@@ -19,6 +19,7 @@ mod capture;
 mod config;
 mod gdi;
 mod overlay;
+mod process;
 mod raster;
 mod settings;
 mod sound;
@@ -214,7 +215,9 @@ fn shot_saved(saved: capture::Saved) {
 /// file association machinery (several MB) is never loaded into this process.
 fn open_last_shot() {
     let Some(Some(path)) = with_app(|a| a.last_shot.clone()) else { return };
-    let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
+    if let Some(explorer) = process::explorer() {
+        process::spawn_quiet(&explorer, &[&path.to_string_lossy()]);
+    }
 }
 
 /// Gives freed heap memory back to the system. Large one-off work (a screenshot,

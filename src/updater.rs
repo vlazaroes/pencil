@@ -53,13 +53,7 @@ pub fn enabled() -> bool {
 
 /// Main process: starts one check in a child process that reports back to `notify`.
 pub fn spawn_check(notify: *mut c_void) -> bool {
-    let Ok(exe) = std::env::current_exe() else { return false };
-    // The child handle is dropped (closed) right away; the child runs on its own.
-    std::process::Command::new(exe)
-        .arg(CHECK_ARG)
-        .arg((notify as usize).to_string())
-        .spawn()
-        .is_ok()
+    crate::process::spawn_self(&[CHECK_ARG, &(notify as usize).to_string()])
 }
 
 /// Child process entry point: one attempt, report, return (and the process exits).
@@ -86,10 +80,7 @@ pub fn installer() -> Option<PathBuf> {
 
 /// Runs the installer silently. It closes this process, installs and relaunches Pencil.
 pub fn run_installer(path: &Path) -> bool {
-    std::process::Command::new(path)
-        .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"])
-        .spawn()
-        .is_ok()
+    crate::process::spawn_quiet(path, &["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"])
 }
 
 /// Fixed location, so the main process knows what to run without extra IPC.
