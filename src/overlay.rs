@@ -16,7 +16,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, SystemParametersInfoForDpi, MDT_EFFECTIVE_DPI};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_BACK, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_MENU, VK_NUMPAD1, VK_NUMPAD4,
+    GetKeyState, VK_BACK, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_MENU,
     VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -540,8 +540,6 @@ impl Overlay {
             v if v == k.clear => self.press(Btn::Clear),
             v if v == k.capture => self.press(Btn::Capture),
             VK_DELETE | VK_BACK => self.press(Btn::Clear),
-            0x31..=0x34 /* 1-4 */ => self.set_size((vk - 0x31) as usize),
-            VK_NUMPAD1..=VK_NUMPAD4 => self.set_size((vk - VK_NUMPAD1) as usize),
             _ => Effect::None,
         }
     }
