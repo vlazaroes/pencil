@@ -94,6 +94,7 @@ impl Hotkey {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Keys {
     pub pencil: u16,
+    pub highlight: u16,
     pub size: u16,
     pub clear: u16,
     pub capture: u16,
@@ -101,8 +102,9 @@ pub struct Keys {
 }
 
 impl Keys {
-    pub fn all(&self) -> [u16; 5] {
-        [self.pencil, self.size, self.clear, self.capture, self.laser]
+    /// In the order of the Settings rows.
+    pub fn all(&self) -> [u16; 6] {
+        [self.pencil, self.highlight, self.size, self.clear, self.laser, self.capture]
     }
 
     pub fn is_valid(&self) -> bool {
@@ -125,6 +127,7 @@ impl Default for Config {
             hotkey: Hotkey { mods: MOD_CONTROL | MOD_ALT, vk: b'D' as u32 },
             keys: Keys {
                 pencil: b'P' as u16,
+                highlight: b'H' as u16,
                 size: b'S' as u16,
                 clear: b'E' as u16,
                 capture: b'C' as u16,
@@ -145,10 +148,12 @@ impl Config {
             .unwrap_or(d.hotkey);
         let keys = match (read("PencilKey"), read("SizeKey"), read("ClearKey")) {
             (Some(p), Some(s), Some(c)) => {
-                // Settings saved before the capture or laser keys existed get their defaults.
+                // Settings saved before the capture, highlighter or laser keys existed get their defaults.
                 let capture = read("CaptureKey").map_or(d.keys.capture, |v| v as u16);
+                let highlight = read("HighlightKey").map_or(d.keys.highlight, |v| v as u16);
                 let laser = read("LaserKey").map_or(d.keys.laser, |v| v as u16);
-                Some(Keys { pencil: p as u16, size: s as u16, clear: c as u16, capture, laser }).filter(Keys::is_valid)
+                Some(Keys { pencil: p as u16, highlight, size: s as u16, clear: c as u16, capture, laser })
+                    .filter(Keys::is_valid)
             }
             _ => None,
         }
@@ -160,6 +165,7 @@ impl Config {
     pub fn save(&self) {
         write("Hotkey", (self.hotkey.mods << 16) | self.hotkey.vk);
         write("PencilKey", self.keys.pencil as u32);
+        write("HighlightKey", self.keys.highlight as u32);
         write("SizeKey", self.keys.size as u32);
         write("ClearKey", self.keys.clear as u32);
         write("CaptureKey", self.keys.capture as u32);
