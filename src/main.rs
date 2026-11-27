@@ -8,7 +8,8 @@
 //!   * the global hotkey again (works even if the overlay does not have focus),
 //!   * Esc or Alt+F4,
 //!   * the toolbar X button,
-//!   * losing focus (Alt+Tab, Windows key, Ctrl+Alt+Del, session lock...),
+//!   * losing focus (Alt+Tab, Windows key, Ctrl+Alt+Del, session lock...), except
+//!     with the laser on, since then the other windows are meant to be used,
 //!   * a display/monitor configuration change,
 //!   * any panic (`panic = "abort"` profile: the process dies and Windows removes
 //!     its windows).
@@ -18,6 +19,7 @@
 mod capture;
 mod config;
 mod gdi;
+mod laser;
 mod overlay;
 mod process;
 mod raster;
@@ -54,6 +56,8 @@ use config::{hotkey_text, Config, Hotkey};
 use overlay::{Effect, Overlay, PenState, Tool};
 
 const HOTKEY_ID: i32 = 1;
+/// Window class of the hidden control window (the update checker looks for it).
+pub const CTRL_CLASS: &str = "PencilCtrl";
 
 /// Default pen: red pencil, yellow highlighter, 2nd size.
 const DEFAULT_PEN: PenState = PenState { tool: Tool::Pen, color: 1, hl_color: 0, size: 1 };
@@ -92,6 +96,10 @@ struct App {
     pen: PenState,
     /// Last saved screenshot, opened when its notification is clicked.
     last_shot: Option<std::path::PathBuf>,
+    /// The update checker process started last, until its result is read.
+    update_check: Option<process::Child>,
+    /// That checker downloaded an installer, waiting to run when the user is idle.
+    update_ready: bool,
 }
 
 thread_local! {
@@ -306,12 +314,32 @@ pub fn class_icons() -> (HICON, HICON) {
 
 // --------------------------------------------------------------- wndprocs
 
+/// Low-level mouse hook, installed only while the laser is on. It runs on this
+/// thread and must return quickly: it only hands the position to the overlay.
+///
+/// # Safety
+/// Only for Windows to call, with the arguments of a WH_MOUSE_LL hook.
+pub unsafe extern "system" fn laser_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 && wp as u32 == WM_MOUSEMOVE {
+        let pt = (*(lp as *const MSLLHOOKSTRUCT)).pt;
+        with_app(|a| {
+            if let Some(o) = a.overlay.as_mut() {
+                o.laser_move(pt.x, pt.y);
+            }
+        });
+    }
+    CallNextHookEx(null_mut(), code, wp, lp)
+}
+
 unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         // Safety net: if the overlay loses focus for any reason, it closes.
         WM_ACTIVATE => {
             if (wp & 0xFFFF) as u32 == WA_INACTIVE {
-                post_hide();
+                let laser = with_app(|a| a.overlay.as_ref().is_some_and(|o| o.laser_on())).unwrap_or(false);
+                if !laser {
+                    post_hide();
+                }
             }
             0
         }
@@ -326,9 +354,16 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             let mut pt = POINT { x: 0, y: 0 };
             GetCursorPos(&mut pt);
             windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
-            let hand = with_app(|a| a.overlay.as_ref().is_some_and(|o| o.over_button(pt.x, pt.y)))
-                .unwrap_or(false);
-            SetCursor(LoadCursorW(null_mut(), if hand { IDC_HAND } else { IDC_CROSS }));
+            let (hand, laser) = with_app(|a| {
+                a.overlay.as_ref().map_or((false, false), |o| (o.over_button(pt.x, pt.y), o.laser_on()))
+            })
+            .unwrap_or((false, false));
+            let cursor = match (hand, laser) {
+                (true, _) => IDC_HAND,
+                (false, true) => IDC_ARROW,
+                (false, false) => IDC_CROSS,
+            };
+            SetCursor(LoadCursorW(null_mut(), cursor));
             1
         }
         WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_CAPTURECHANGED | WM_KEYDOWN | WM_KEYUP | WM_TIMER => {
@@ -372,26 +407,24 @@ unsafe extern "system" fn ctrl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_TIMER if wp == TIMER_CHECK => {
             KillTimer(hwnd, TIMER_CHECK);
             UPDATE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-            updater::spawn_check(hwnd);
+            let child = updater::spawn_check(hwnd);
+            with_app(|a| a.update_check = child);
             0
         }
-        // The checker hit a network error: schedule the next attempt, if any is left.
-        updater::WM_UPDATE_FAILED => {
-            schedule_update_check();
-            0
-        }
-        updater::WM_UPDATE_READY | WM_TIMER => {
-            KillTimer(hwnd, TIMER_INSTALL);
-            // Never interrupt a drawing or an open settings window: retry in a minute.
-            let busy = settings::hwnd().is_some() || with_app(|a| a.overlay.is_some()).unwrap_or(true);
-            if busy {
-                SetTimer(hwnd, TIMER_INSTALL, 60_000, None);
-            } else if let Some(path) = updater::installer() {
-                // The installer closes this process anyway; exit right away so it does not wait.
-                if updater::run_installer(&path) {
-                    DestroyWindow(hwnd);
+        // Only a wake-up call: the checker's exit code says what really happened.
+        updater::WM_UPDATE_FAILED | updater::WM_UPDATE_READY => {
+            match update_outcome() {
+                Some(updater::Outcome::Failed) => schedule_update_check(),
+                Some(updater::Outcome::Ready) => {
+                    with_app(|a| a.update_ready = true);
+                    try_install(hwnd);
                 }
+                _ => {}
             }
+            0
+        }
+        WM_TIMER if wp == TIMER_INSTALL => {
+            try_install(hwnd);
             0
         }
         // Windows is shutting down, or an installer asked us to close (Restart Manager).
@@ -438,6 +471,36 @@ unsafe extern "system" fn ctrl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             0
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+/// Result of the running update check, if it has finished; the process handle
+/// is released once read. Kept while the checker is still running, so a message
+/// posted by someone else in the meantime changes nothing.
+fn update_outcome() -> Option<updater::Outcome> {
+    let child = with_app(|a| a.update_check.take()).flatten()?;
+    let outcome = updater::outcome(&child);
+    if outcome.is_none() {
+        with_app(|a| a.update_check = Some(child));
+    }
+    outcome
+}
+
+/// Runs the downloaded installer, unless the user is busy: then retries in a minute.
+unsafe fn try_install(hwnd: HWND) {
+    KillTimer(hwnd, TIMER_INSTALL);
+    if !with_app(|a| a.update_ready).unwrap_or(false) {
+        return;
+    }
+    // Never interrupt a drawing or an open settings window.
+    let busy = settings::hwnd().is_some() || with_app(|a| a.overlay.is_some()).unwrap_or(true);
+    if busy {
+        SetTimer(hwnd, TIMER_INSTALL, 60_000, None);
+    } else if let Some(path) = updater::installer() {
+        // The installer closes this process anyway; exit right away so it does not wait.
+        if updater::run_installer(&path) {
+            DestroyWindow(hwnd);
+        }
     }
 }
 
@@ -557,7 +620,7 @@ fn main() {
     let mut args = std::env::args_os().skip(1);
     let arg = args.next();
     if arg.as_deref() == Some(std::ffi::OsStr::new(updater::CHECK_ARG)) {
-        return updater::run_check(args.next().as_deref());
+        std::process::exit(updater::run_check(args.next().as_deref()) as i32);
     }
     if arg.as_deref() == Some(std::ffi::OsStr::new(sound::PLAY_ARG)) {
         return sound::play_and_exit();
@@ -575,14 +638,14 @@ fn main() {
             if !mutex.is_null() {
                 CloseHandle(mutex);
             }
-            return error_box("Pencil is already running (see its icon in the notification area).");
+            return error_box("Pencil is already running.");
         }
 
         // Physical pixel coordinates on every monitor.
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
         let hinst = GetModuleHandleW(null_mut());
-        let ctrl_class = wide("PencilCtrl");
+        let ctrl_class = wide(CTRL_CLASS);
         let overlay_class = wide("PencilOverlay");
 
         let mut wc: WNDCLASSEXW = std::mem::zeroed();
@@ -630,6 +693,8 @@ fn main() {
                 hotkey_active,
                 pen: DEFAULT_PEN,
                 last_shot: None,
+                update_check: None,
+                update_ready: false,
             })
         });
         let tray = Tray::new(hwnd, &tray_tip());

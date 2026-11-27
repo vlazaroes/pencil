@@ -11,6 +11,11 @@
 //! at the minimum. The child makes one attempt, posts the result to the main
 //! process's control window and exits; the main process schedules retries.
 //!
+//! Any process of the user can post messages to that window, so the message is
+//! only a wake-up call: the result is read from the exit code of the child the
+//! main process started itself, and the installer only runs after a genuine
+//! "ready" from it.
+//!
 //! Only installed copies update, so development builds never replace themselves.
 //! Any failure simply means "no update this time".
 
@@ -21,10 +26,11 @@ use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Networking::WinHttp::*;
-use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindow, PostMessageW, WM_APP};
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, IsWindow, PostMessageW, WM_APP};
 
 use crate::config::read_reg_sz;
-use crate::wide;
+use crate::process::Child;
+use crate::{wide, CTRL_CLASS};
 
 const HOST: &str = "github.com";
 const REPO: &str = "vlazaroes/pencil";
@@ -45,6 +51,18 @@ pub const ATTEMPT_DELAYS_MS: [u32; 3] = [15_000, 60_000, 300_000];
 pub const WM_UPDATE_READY: u32 = WM_APP + 3;
 /// Posted by the checker: network failure, worth retrying later.
 pub const WM_UPDATE_FAILED: u32 = WM_APP + 4;
+/// Exit codes of the checker process, the trusted version of the messages above.
+const EXIT_FAILED: u32 = 1;
+const EXIT_READY: u32 = 2;
+
+/// Outcome of a finished check, as read by the main process.
+#[derive(PartialEq, Eq, Debug)]
+pub enum Outcome {
+    /// Nothing to do: up to date, or the checker gave up early.
+    None,
+    Failed,
+    Ready,
+}
 
 /// Main process: whether this copy should look for updates (installed copies only).
 pub fn enabled() -> bool {
@@ -52,24 +70,50 @@ pub fn enabled() -> bool {
 }
 
 /// Main process: starts one check in a child process that reports back to `notify`.
-pub fn spawn_check(notify: *mut c_void) -> bool {
-    crate::process::spawn_self(&[CHECK_ARG, &(notify as usize).to_string()])
+pub fn spawn_check(notify: *mut c_void) -> Option<Child> {
+    crate::process::spawn_self_child(&[CHECK_ARG, &(notify as usize).to_string()])
 }
 
-/// Child process entry point: one attempt, report, return (and the process exits).
-pub fn run_check(notify: Option<&OsStr>) {
-    let Some(hwnd) = notify.and_then(|s| s.to_str()?.parse::<usize>().ok()) else { return };
+/// Main process: the result of `child`, once it has exited. A message claiming a
+/// result while the checker is still running did not come from it: `None`.
+pub fn outcome(child: &Child) -> Option<Outcome> {
+    // The checker posts right before exiting: give it a moment to finish.
+    Some(match child.exit_code(2_000)? {
+        EXIT_READY => Outcome::Ready,
+        EXIT_FAILED => Outcome::Failed,
+        _ => Outcome::None,
+    })
+}
+
+/// Child process entry point: one attempt, report, and return the exit code
+/// for the process.
+pub fn run_check(notify: Option<&OsStr>) -> u32 {
+    let Some(hwnd) = notify.and_then(|s| s.to_str()?.parse::<usize>().ok()) else { return 0 };
     let hwnd = hwnd as *mut c_void;
-    if unsafe { IsWindow(hwnd) } == 0 {
-        return;
+    if !is_pencil_window(hwnd) {
+        return 0;
     }
     remove_old_installers();
-    let msg = match check() {
-        Check::UpToDate => return,
-        Check::Failed => WM_UPDATE_FAILED,
-        Check::Ready => WM_UPDATE_READY,
+    let (msg, code) = match check() {
+        Check::UpToDate => return 0,
+        Check::Failed => (WM_UPDATE_FAILED, EXIT_FAILED),
+        Check::Ready => (WM_UPDATE_READY, EXIT_READY),
     };
     unsafe { PostMessageW(hwnd, msg, 0, 0) };
+    code
+}
+
+/// Whether `hwnd` is Pencil's control window, so the checker never posts to
+/// whatever other window a forged command line points at.
+fn is_pencil_window(hwnd: *mut c_void) -> bool {
+    let mut buf = [0u16; 64];
+    let n = unsafe {
+        if IsWindow(hwnd) == 0 {
+            return false;
+        }
+        GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32)
+    };
+    n > 0 && String::from_utf16_lossy(&buf[..n as usize]) == CTRL_CLASS
 }
 
 /// Main process: the downloaded installer, if there is one.
@@ -85,7 +129,7 @@ pub fn run_installer(path: &Path) -> bool {
 
 /// Fixed location, so the main process knows what to run without extra IPC.
 fn installer_path() -> PathBuf {
-    std::env::temp_dir().join(format!("{TEMP_PREFIX}update.exe"))
+    std::env::temp_dir().join(format!("{TEMP_PREFIX}Update.exe"))
 }
 
 enum Check {

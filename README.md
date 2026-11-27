@@ -35,7 +35,7 @@ Default shortcuts (all but the fixed ones can be changed in *Settings*):
 | Highlighter: cycle color (yellow → green → pink → blue) | click the marker, `H` |
 | Size (4 presets, 2nd by default; pencil and highlighter) | click the dot, `S` |
 | Clear everything | eraser, `E`, `Del` and `Backspace` (fixed) |
-| Size presets | `1`–`4` (fixed) |
+| Laser pointer: a red dot with a fading trail; meanwhile the PC works as usual (clicks go through) and the pencil or highlighter go back to drawing | laser button, `L` |
 | Undo (also brings back a cleared drawing) | `Ctrl+Z` (fixed) |
 | Redo | `Ctrl+Y` or `Ctrl+Shift+Z` (fixed) |
 | Screenshot of an area | camera button, `C` (`Esc` cancels the selection) |

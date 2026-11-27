@@ -98,12 +98,13 @@ pub struct Keys {
     pub size: u16,
     pub clear: u16,
     pub capture: u16,
+    pub laser: u16,
 }
 
 impl Keys {
     /// In the order of the Settings rows.
-    pub fn all(&self) -> [u16; 5] {
-        [self.pencil, self.highlight, self.size, self.clear, self.capture]
+    pub fn all(&self) -> [u16; 6] {
+        [self.pencil, self.highlight, self.size, self.clear, self.laser, self.capture]
     }
 
     pub fn is_valid(&self) -> bool {
@@ -130,6 +131,7 @@ impl Default for Config {
                 size: b'S' as u16,
                 clear: b'E' as u16,
                 capture: b'C' as u16,
+                laser: b'L' as u16,
             },
             theme: ThemePref::System,
         }
@@ -146,10 +148,12 @@ impl Config {
             .unwrap_or(d.hotkey);
         let keys = match (read("PencilKey"), read("SizeKey"), read("ClearKey")) {
             (Some(p), Some(s), Some(c)) => {
-                // Settings saved before the capture or highlighter keys existed get their defaults.
+                // Settings saved before the capture, highlighter or laser keys existed get their defaults.
                 let capture = read("CaptureKey").map_or(d.keys.capture, |v| v as u16);
                 let highlight = read("HighlightKey").map_or(d.keys.highlight, |v| v as u16);
-                Some(Keys { pencil: p as u16, highlight, size: s as u16, clear: c as u16, capture }).filter(Keys::is_valid)
+                let laser = read("LaserKey").map_or(d.keys.laser, |v| v as u16);
+                Some(Keys { pencil: p as u16, highlight, size: s as u16, clear: c as u16, capture, laser })
+                    .filter(Keys::is_valid)
             }
             _ => None,
         }
@@ -165,6 +169,7 @@ impl Config {
         write("SizeKey", self.keys.size as u32);
         write("ClearKey", self.keys.clear as u32);
         write("CaptureKey", self.keys.capture as u32);
+        write("LaserKey", self.keys.laser as u32);
         write("Theme", self.theme as u32);
     }
 }
@@ -242,8 +247,6 @@ fn is_modifier(vk: u16) -> bool {
 pub fn is_reserved(vk: u16) -> bool {
     is_modifier(vk)
         || matches!(vk, VK_ESCAPE | VK_DELETE | VK_BACK | VK_RETURN | VK_TAB | VK_SPACE)
-        || (0x31..=0x34).contains(&vk)
-        || (VK_NUMPAD1..=VK_NUMPAD4).contains(&vk)
 }
 
 /// Keys that need the "extended" flag for their name and for the hotkey control.

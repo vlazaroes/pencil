@@ -29,16 +29,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Expressions are passed through `env:` and never pasted into the scripts, so
+      # no input value can turn into code.
       - name: Compute version
         id: version
         shell: pwsh
+        env:
+          BUMP: ${{ inputs.bump }}
         run: |
           $current = (Select-String -Path Cargo.toml -Pattern '^version = "(\d+)\.(\d+)\.(\d+)"').Matches[0]
           if (-not $current) { throw "No x.y.z version found in Cargo.toml" }
           [int]$major = $current.Groups[1].Value
           [int]$minor = $current.Groups[2].Value
           [int]$patch = $current.Groups[3].Value
-          switch ("${{ inputs.bump }}") {
+          switch ($env:BUMP) {
             "major"   { $major++; $minor = 0; $patch = 0 }
             "minor"   { $minor++; $patch = 0 }
             "patch"   { $patch++ }
@@ -51,8 +55,10 @@ jobs:
 
       - name: Set version in Cargo.toml
         shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          $v = "${{ steps.version.outputs.version }}"
+          $v = $env:VERSION
           $toml = Get-Content Cargo.toml -Raw
           $toml = [regex]::Replace($toml, '(?m)^version = "[^"]+"', "version = `"$v`"", 1)
           [IO.File]::WriteAllText("$PWD\Cargo.toml", $toml)
@@ -61,34 +67,51 @@ jobs:
       - name: Build
         run: cargo build --release
 
+      # A fixed version from the official release, checked against its SHA-256
+      # before it runs: never whatever a package feed serves that day.
       - name: Install Inno Setup
         shell: pwsh
+        env:
+          INNO_URL: https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe
+          INNO_SHA256: a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c
         run: |
-          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
-            choco install innosetup -y --no-progress
-          }
+          $setup = Join-Path $env:RUNNER_TEMP "innosetup.exe"
+          Invoke-WebRequest $env:INNO_URL -OutFile $setup
+          $hash = (Get-FileHash $setup -Algorithm SHA256).Hash
+          if ($hash -ne $env:INNO_SHA256) { throw "Inno Setup hash mismatch: $hash" }
+          $dir = Join-Path $env:RUNNER_TEMP "inno"
+          Start-Process $setup -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=`"$dir`"" -Wait
+          if (-not (Test-Path "$dir\ISCC.exe")) { throw "Inno Setup was not installed" }
+          "ISCC=$dir\ISCC.exe" >> $env:GITHUB_ENV
 
       - name: Build installer
         shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=${{ steps.version.outputs.version }}" installer\pencil.iss
+          & $env:ISCC "/DAppVersion=$env:VERSION" installer\pencil.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # Only once everything is built, so a failure never leaves a tag without a release.
       - name: Commit and tag
         shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          BRANCH: ${{ github.ref_name }}
         run: |
-          $v = "${{ steps.version.outputs.version }}"
+          $v = $env:VERSION
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock
           git diff --cached --quiet
           if ($LASTEXITCODE -ne 0) { git commit -m "chore: release v$v" }
           git tag "v$v"
-          git push origin "HEAD:${{ github.ref_name }}"
+          git push origin "HEAD:$env:BRANCH"
           git push origin "v$v"
 
       - name: Publish release
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "v${{ steps.version.outputs.version }}" installer/Output/PencilSetup.exe --title "Pencil v${{ steps.version.outputs.version }}" --generate-notes
+          VERSION: ${{ steps.version.outputs.version }}
+        run: gh release create "v$env:VERSION" installer/Output/PencilSetup.exe --title "Pencil v$env:VERSION" --generate-notes
