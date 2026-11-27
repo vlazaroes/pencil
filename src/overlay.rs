@@ -17,6 +17,7 @@ use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_
 use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, SystemParametersInfoForDpi, MDT_EFFECTIVE_DPI};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_BACK, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_MENU, VK_NUMPAD1, VK_NUMPAD4,
+    VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, GetCursorPos, GetSystemMetrics, KillTimer, SetTimer,
@@ -149,6 +150,14 @@ enum Shot {
     Window { target: Rect },
 }
 
+/// One undoable action. Strokes are kept as data (a few KB each) rather than
+/// pixels, so undoing re-renders the remaining ones instead of storing copies of
+/// the full-screen canvas.
+enum Op {
+    Stroke { color: usize, size: usize, points: Vec<(f32, f32)> },
+    Clear,
+}
+
 /// `MK_CONTROL` in the wParam of mouse messages: Ctrl is down.
 const MK_CONTROL: usize = 0x0008;
 
@@ -275,6 +284,9 @@ pub struct Overlay {
     pressed: Option<Btn>,
     drawing: bool,
     last: (f32, f32),
+    /// Undo / redo stacks, oldest first. Freed with the overlay.
+    history: Vec<Op>,
+    redo: Vec<Op>,
     dirty: Rect,
     menu_dirty: bool,
     first_flush: bool,
@@ -342,6 +354,8 @@ impl Overlay {
             hover: None,
             pressed: None,
             drawing: false,
+            history: Vec::new(),
+            redo: Vec::new(),
             last: (0.0, 0.0),
             dirty: Rect::EMPTY,
             menu_dirty: true,
@@ -388,6 +402,9 @@ impl Overlay {
                     let p = (x as f32 + 0.5, y as f32 + 0.5);
                     self.paint(self.last, p);
                     self.last = p;
+                    if let Some(Op::Stroke { points, .. }) = self.history.last_mut() {
+                        points.push(p);
+                    }
                 } else {
                     self.set_hover(self.hit(x, y));
                 }
@@ -411,6 +428,8 @@ impl Overlay {
                     self.drawing = true;
                     self.last = (x as f32 + 0.5, y as f32 + 0.5);
                     self.paint(self.last, self.last);
+                    self.history.push(Op::Stroke { color: self.color, size: self.size, points: vec![self.last] });
+                    self.redo.clear();
                     self.set_hover(None);
                     fx = Effect::MouseCapture;
                 }
@@ -498,7 +517,19 @@ impl Overlay {
             }
             return Effect::None;
         }
-        let mods = unsafe { GetKeyState(VK_CONTROL as i32) < 0 || GetKeyState(VK_MENU as i32) < 0 };
+        let (ctrl, alt, shift) =
+            unsafe { (GetKeyState(VK_CONTROL as i32) < 0, GetKeyState(VK_MENU as i32) < 0, GetKeyState(VK_SHIFT as i32) < 0) };
+        // Undo / redo while drawing mode is idle (in screenshot mode Ctrl points at
+        // windows). Auto-repeat is allowed: holding Ctrl+Z keeps undoing.
+        if ctrl && !alt && self.shot == Shot::Off && !self.drawing {
+            match vk {
+                0x5A /* Z */ if shift => return self.redo(),
+                0x5A /* Z */ => return self.undo(),
+                0x59 /* Y */ => return self.redo(),
+                _ => {}
+            }
+        }
+        let mods = ctrl || alt;
         if repeat || mods {
             return Effect::None; // keeps the global hotkey itself from triggering actions
         }
@@ -524,7 +555,12 @@ impl Overlay {
             }
             Btn::Size => self.set_size((self.size + 1) % SIZES.len()),
             Btn::Clear => {
-                self.clear();
+                // Only when something is visible, so undo never has empty steps.
+                if matches!(self.history.last(), Some(Op::Stroke { .. })) {
+                    self.history.push(Op::Clear);
+                    self.redo.clear();
+                    self.clear();
+                }
                 Effect::None
             }
             Btn::Capture => {
@@ -728,10 +764,67 @@ impl Overlay {
         Surface { px: &mut self.under, w: a.width(), h: a.height(), ox: a.l, oy: a.t }
     }
 
-    /// Paints a stroke segment from `a` to `b`.
+    /// Removes the last stroke (or brings back what the eraser cleared).
+    fn undo(&mut self) -> Effect {
+        if let Some(op) = self.history.pop() {
+            self.redo.push(op);
+            self.rerender();
+        }
+        Effect::None
+    }
+
+    /// Re-applies the last undone action; no full re-render needed.
+    fn redo(&mut self) -> Effect {
+        let Some(op) = self.redo.pop() else { return Effect::None };
+        match &op {
+            Op::Stroke { color, size, points } => {
+                self.paint_stroke(*color, *size, points);
+                self.draw_menu();
+            }
+            Op::Clear => self.clear(),
+        }
+        self.history.push(op);
+        Effect::None
+    }
+
+    /// Redraws the canvas from the history: only what came after the last clear.
+    fn rerender(&mut self) {
+        self.dib.surface().fill(BG);
+        self.under.fill(BG);
+        let start = self.history.iter().rposition(|op| matches!(op, Op::Clear)).map_or(0, |i| i + 1);
+        let ops = std::mem::take(&mut self.history);
+        for op in &ops[start..] {
+            if let Op::Stroke { color, size, points } = op {
+                self.paint_stroke(*color, *size, points);
+            }
+        }
+        self.history = ops;
+        self.dirty = Rect::new(0, 0, self.dib.w, self.dib.h);
+        self.draw_menu();
+    }
+
+    /// Paints a whole recorded stroke exactly as it was drawn live.
+    fn paint_stroke(&mut self, color: usize, size: usize, points: &[(f32, f32)]) {
+        let mut prev = points[0];
+        self.paint_with(color, size, prev, prev);
+        for &p in &points[1..] {
+            self.paint_with(color, size, prev, p);
+            prev = p;
+        }
+    }
+
+    /// Paints a stroke segment from `a` to `b` with the current pen.
     fn paint(&mut self, a: (f32, f32), b: (f32, f32)) {
-        let r = (SIZES[self.size] * self.lay.s * 0.5).max(0.75);
-        let c = COLORS[self.color];
+        self.paint_with(self.color, self.size, a, b);
+        if self.menu_dirty {
+            self.draw_menu();
+        }
+    }
+
+    /// Paints a segment; the caller redraws the toolbar if `menu_dirty` was set.
+    fn paint_with(&mut self, color: usize, size: usize, a: (f32, f32), b: (f32, f32)) {
+        let r = (SIZES[size] * self.lay.s * 0.5).max(0.75);
+        let c = COLORS[color];
         // Split long segments so the box to scan stays small.
         let len = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
         let n = (len / (r * 4.0).max(24.0)).ceil().max(1.0) as usize;
@@ -745,9 +838,6 @@ impl Overlay {
                 self.menu_dirty = true;
             }
             self.dirty = self.dirty.union(&bounds.intersect(&screen));
-        }
-        if self.menu_dirty {
-            self.draw_menu();
         }
     }
 

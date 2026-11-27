@@ -54,8 +54,8 @@ use overlay::{Effect, Overlay};
 
 const HOTKEY_ID: i32 = 1;
 
-/// Default pen: blue, 2nd size.
-const DEFAULT_COLOR: usize = 0;
+/// Default pen: red, 2nd size.
+const DEFAULT_COLOR: usize = 1;
 const DEFAULT_SIZE: usize = 1;
 
 const WM_APP_HIDE: u32 = WM_APP + 1;
