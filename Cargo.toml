@@ -1,6 +1,6 @@
 [package]
 name = "pencil"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 description = "Full-screen drawing overlay toggled by a global hotkey (Windows)"
 
