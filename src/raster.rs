@@ -183,7 +183,7 @@ pub fn blend(dst: u32, c: Rgb, a: u32) -> u32 {
 }
 
 #[inline]
-fn sd_segment(px: f32, py: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
+pub fn sd_segment(px: f32, py: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
     let (pax, pay) = (px - a.0, py - a.1);
     let (bax, bay) = (b.0 - a.0, b.1 - a.1);
     let len2 = bax * bax + bay * bay;

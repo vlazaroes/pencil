@@ -28,11 +28,11 @@ const CLASS: &str = "PencilSettings";
 const TITLE: &str = "Settings";
 
 /// Labels in `ctl` index order (hotkeys, then theme). The theme row is shown first.
-const LABELS: [&str; ROWS] = ["Show / Hide", "Color", "Size", "Erase", "Capture", "Theme"];
+const LABELS: [&str; ROWS] = ["Show / Hide", "Color", "Size", "Erase", "Capture", "Laser", "Theme"];
 /// Visual row of each `ctl` index.
-const ROW: [i32; ROWS] = [1, 2, 3, 4, 5, 0];
+const ROW: [i32; ROWS] = [1, 2, 3, 4, 5, 6, 0];
 /// Form rows: the show/hide hotkey, the tool keys, then the theme.
-const ROWS: usize = 6;
+const ROWS: usize = 7;
 /// Index of the theme combo box in `ctl` (the hotkey controls come before it).
 const THEME: usize = ROWS - 1;
 const THEMES: [&str; 3] = ["System", "Light", "Dark"];
@@ -267,8 +267,8 @@ unsafe fn read_form(w: &Win) -> Result<Config, String> {
     if !hotkey.is_valid() {
         return Err("The Show / Hide shortcut must include Ctrl or Alt plus another key.".into());
     }
-    let k = [1, 2, 3, 4].map(|i| get_hotkey(w.ctl[i]).vk as u16);
-    let keys = Keys { pencil: k[0], size: k[1], clear: k[2], capture: k[3] };
+    let k = [1, 2, 3, 4, 5].map(|i| get_hotkey(w.ctl[i]).vk as u16);
+    let keys = Keys { pencil: k[0], size: k[1], clear: k[2], capture: k[3], laser: k[4] };
     if k.contains(&0) {
         return Err("Every tool needs a shortcut.".into());
     }

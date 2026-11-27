@@ -5,6 +5,7 @@
 //! screen-sized memory and uses no CPU/GPU.
 
 use std::ptr::null_mut;
+use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, POINT, RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -20,7 +21,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GetCursorPos, GetSystemMetrics, KillTimer, SetTimer,
+    CreateWindowExW, DestroyWindow, GetCursorPos, GetSystemMetrics, GetWindowLongW, KillTimer,
+    SetTimer, SetWindowLongW, SetWindowsHookExW, UnhookWindowsHookEx, GWL_EXSTYLE, HHOOK,
+    WH_MOUSE_LL, WS_EX_TRANSPARENT,
     UpdateLayeredWindowIndirect, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, WM_TIMER,
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     UPDATELAYEREDWINDOWINFO, ULW_ALPHA, WM_CAPTURECHANGED, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
@@ -30,6 +33,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::capture::{self, Image, Veil};
 use crate::config::{Config, Keys, ThemePref};
 use crate::gdi::Dib;
+use crate::laser::{self, Laser};
 use crate::raster::{blend, sd_round_rect, Rect, Rgb, Surface};
 use crate::wide;
 
@@ -57,6 +61,9 @@ const NOTICE_WARN: Rgb = Rgb(230, 150, 30);
 /// Timer on the overlay window that dismisses the notice.
 const NOTICE_TIMER: usize = 1;
 const NOTICE_MS: u32 = 4000;
+/// Timer on the overlay window that, while the laser is on, follows the cursor
+/// and animates the fading trail.
+const LASER_TIMER: usize = 2;
 const WHITE: Rgb = Rgb(255, 255, 255);
 
 /// Toolbar palette, picked from the system light/dark app mode.
@@ -124,6 +131,7 @@ fn theme_for(pref: ThemePref) -> &'static Theme {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Btn {
     Pencil,
+    Laser,
     Size,
     Clear,
     Capture,
@@ -131,12 +139,12 @@ enum Btn {
     /// The screenshot notice above the toolbar (not part of `BTNS`).
     Notice,
 }
-const BTNS: [Btn; 5] = [Btn::Pencil, Btn::Size, Btn::Clear, Btn::Capture, Btn::Close];
+const BTNS: [Btn; 6] = [Btn::Pencil, Btn::Size, Btn::Clear, Btn::Laser, Btn::Capture, Btn::Close];
 /// Buttons inside the main panel (the close button sits apart).
-const MAIN_BTNS: usize = 4;
+const MAIN_BTNS: usize = 5;
 /// The drawing tools come before this index; a vertical separator sets the
 /// screenshot button apart from them.
-const SEP_BEFORE: usize = 3;
+const SEP_BEFORE: usize = 4;
 
 /// Screenshot selection state.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -187,8 +195,8 @@ struct Layout {
     s: f32,
     main: FRect,
     close: FRect,
-    btn: [FRect; 5],
-    hit: [Rect; 5],
+    btn: [FRect; 6],
+    hit: [Rect; 6],
     /// Vertical separator line before the screenshot button: x, top and bottom.
     sep: (f32, f32, f32),
     /// Toolbar panels: clicks here never draw.
@@ -237,7 +245,7 @@ impl Layout {
         let cl = main.2 + (14.0 * s).round();
         let close = (cl, bottom - h, cl + h, bottom);
 
-        let mut b = [(0.0, 0.0, 0.0, 0.0); 5];
+        let mut b = [(0.0, 0.0, 0.0, 0.0); 6];
         for (i, r) in b.iter_mut().take(MAIN_BTNS).enumerate() {
             let extra = if i >= SEP_BEFORE { sep_room } else { 0.0 };
             let x = main.0 + pad + i as f32 * (btn + gap) + extra;
@@ -283,6 +291,16 @@ pub struct Overlay {
     hover: Option<Btn>,
     pressed: Option<Btn>,
     drawing: bool,
+    /// Laser pointer mode: a fading trail follows the cursor and, outside the
+    /// toolbar, clicks go through to the windows underneath.
+    laser_on: bool,
+    laser: Laser,
+    /// Whether the window currently lets the mouse through (`WS_EX_TRANSPARENT`).
+    click_through: bool,
+    /// Low-level mouse hook that feeds the laser every move, while it is on.
+    hook: HHOOK,
+    /// When the laser was last drawn.
+    last_frame: Instant,
     last: (f32, f32),
     /// Undo / redo stacks, oldest first. Freed with the overlay.
     history: Vec<Op>,
@@ -354,6 +372,11 @@ impl Overlay {
             hover: None,
             pressed: None,
             drawing: false,
+            laser_on: false,
+            laser: Laser::new(),
+            click_through: false,
+            hook: null_mut(),
+            last_frame: Instant::now(),
             history: Vec::new(),
             redo: Vec::new(),
             last: (0.0, 0.0),
@@ -381,7 +404,12 @@ impl Overlay {
     pub fn handle(&mut self, msg: u32, wp: usize, lp: isize) -> Effect {
         let x = (lp & 0xFFFF) as i16 as i32;
         let y = ((lp >> 16) & 0xFFFF) as i16 as i32;
+        if msg == WM_TIMER && wp == LASER_TIMER {
+            self.laser_tick();
+            return Effect::None;
+        }
         let mut fx = Effect::None;
+        self.erase_laser();
         match msg {
             WM_MOUSEMOVE => {
                 // Ctrl state rides on every mouse message, so the window mode stays in
@@ -424,7 +452,7 @@ impl Overlay {
                     self.set_hover(None);
                     fx = Effect::MouseCapture;
                 }
-                None if !self.lay.bar.contains(x, y) && self.shot == Shot::Off => {
+                None if !self.lay.bar.contains(x, y) && self.shot == Shot::Off && !self.laser_on => {
                     self.drawing = true;
                     self.last = (x as f32 + 0.5, y as f32 + 0.5);
                     self.paint(self.last, self.last);
@@ -479,6 +507,7 @@ impl Overlay {
             _ => {}
         }
         if fx != Effect::Hide {
+            self.draw_laser();
             self.flush();
         }
         fx
@@ -487,6 +516,11 @@ impl Overlay {
     /// Is the (client) point over something clickable (toolbar button or notice)?
     pub fn over_button(&self, x: i32, y: i32) -> bool {
         self.hit(x, y).is_some()
+    }
+
+    /// Is the laser on? Then the overlay stays open when other windows get focus.
+    pub fn laser_on(&self) -> bool {
+        self.laser_on
     }
 
     fn hit(&self, x: i32, y: i32) -> Option<Btn> {
@@ -539,6 +573,7 @@ impl Overlay {
             v if v == k.size => self.press(Btn::Size),
             v if v == k.clear => self.press(Btn::Clear),
             v if v == k.capture => self.press(Btn::Capture),
+            v if v == k.laser => self.press(Btn::Laser),
             VK_DELETE | VK_BACK => self.press(Btn::Clear),
             0x31..=0x34 /* 1-4 */ => self.set_size((vk - 0x31) as usize),
             VK_NUMPAD1..=VK_NUMPAD4 => self.set_size((vk - VK_NUMPAD1) as usize),
@@ -549,8 +584,17 @@ impl Overlay {
     fn press(&mut self, b: Btn) -> Effect {
         match b {
             Btn::Pencil => {
-                self.color = (self.color + 1) % COLORS.len();
-                self.draw_menu();
+                // From the laser the pencil first just brings drawing back.
+                if self.laser_on {
+                    self.set_laser(false);
+                } else {
+                    self.color = (self.color + 1) % COLORS.len();
+                    self.draw_menu();
+                }
+                Effect::None
+            }
+            Btn::Laser => {
+                self.set_laser(!self.laser_on);
                 Effect::None
             }
             Btn::Size => self.set_size((self.size + 1) % SIZES.len()),
@@ -566,6 +610,7 @@ impl Overlay {
             Btn::Capture => {
                 // The button (or its key) toggles the selection mode.
                 if self.shot == Shot::Off {
+                    self.set_laser(false);
                     self.set_shot(Shot::Armed);
                     Effect::None
                 } else {
@@ -587,6 +632,110 @@ impl Overlay {
         } else {
             Effect::None
         }
+    }
+
+    // ------------------------------------------------------------------ laser
+
+    fn set_laser(&mut self, on: bool) {
+        if self.laser_on == on {
+            return;
+        }
+        self.laser_on = on;
+        self.laser.clear();
+        if on {
+            let (x, y) = self.cursor_client();
+            self.laser.push((x as f32 + 0.5, y as f32 + 0.5));
+            // Outside the toolbar the mouse belongs to the windows underneath, so no
+            // WM_MOUSEMOVE arrives here: a low-level hook reports every move as it
+            // happens, and the timer fades the trail once the mouse stops.
+            unsafe {
+                self.hook = SetWindowsHookExW(WH_MOUSE_LL, Some(crate::laser_hook), self.hinst, 0);
+                SetTimer(self.hwnd, LASER_TIMER, laser::FRAME_MS, None);
+            }
+        } else {
+            unsafe { KillTimer(self.hwnd, LASER_TIMER) };
+            self.unhook();
+            self.set_click_through(false);
+        }
+        self.draw_menu(); // the highlighted tool changes
+    }
+
+    /// One laser frame: follows the cursor, lets the clicks through outside the
+    /// toolbar and notice, and fades the trail. Does nothing while all is still.
+    fn unhook(&mut self) {
+        if !self.hook.is_null() {
+            unsafe { UnhookWindowsHookEx(self.hook) };
+            self.hook = null_mut();
+        }
+    }
+
+    /// The mouse moved to the screen point `(sx, sy)` (from the hook). Every move
+    /// joins the trail; a frame is drawn unless the last one is too recent.
+    pub fn laser_move(&mut self, sx: i32, sy: i32) {
+        if !self.laser_on {
+            return;
+        }
+        let (x, y) = (sx - self.origin.0, sy - self.origin.1);
+        self.laser.push((x as f32 + 0.5, y as f32 + 0.5));
+        if self.last_frame.elapsed() >= laser::MIN_FRAME {
+            self.laser_frame(x, y);
+        }
+    }
+
+    fn laser_tick(&mut self) {
+        let (x, y) = self.cursor_client();
+        self.laser_frame(x, y);
+    }
+
+    /// Draws the laser with its dot at the client point `(x, y)`.
+    fn laser_frame(&mut self, x: i32, y: i32) {
+        let solid = self.lay.bar.contains(x, y) || self.notice.as_ref().is_some_and(|n| n.rect.contains(x, y));
+        self.set_click_through(!solid);
+        let p = (x as f32 + 0.5, y as f32 + 0.5);
+        // Away from the toolbar no WM_MOUSEMOVE clears the hover: do it here.
+        let unhover = !solid && self.hover.is_some();
+        if self.laser.head() == Some(p) && !self.laser.trailing() && !unhover {
+            return;
+        }
+        self.erase_laser();
+        if unhover {
+            self.set_hover(None);
+        }
+        self.laser.push(p);
+        self.laser.prune(Instant::now());
+        self.draw_laser();
+        self.flush();
+        self.last_frame = Instant::now();
+    }
+
+    /// Makes the whole window transparent to the mouse, or solid again.
+    fn set_click_through(&mut self, on: bool) {
+        if self.click_through == on {
+            return;
+        }
+        self.click_through = on;
+        unsafe {
+            let ex = GetWindowLongW(self.hwnd, GWL_EXSTYLE) as u32;
+            let ex = if on { ex | WS_EX_TRANSPARENT } else { ex & !WS_EX_TRANSPARENT };
+            SetWindowLongW(self.hwnd, GWL_EXSTYLE, ex as i32);
+        }
+    }
+
+    /// Removes the laser from the canvas, leaving the strokes as they were.
+    fn erase_laser(&mut self) {
+        let r = self.laser.erase(&mut self.dib.surface());
+        self.dirty = self.dirty.union(&r);
+    }
+
+    /// Draws the laser for the current instant. The dot hides over the toolbar,
+    /// where the normal cursor is shown instead.
+    fn draw_laser(&mut self) {
+        if !self.laser_on {
+            return;
+        }
+        let head = self.laser.head().is_some_and(|(x, y)| !self.lay.bar.contains(x as i32, y as i32));
+        let r = self.laser.draw(&mut self.dib.surface(), self.lay.s, head, Instant::now());
+        self.dirty = self.dirty.union(&r);
     }
 
     // ------------------------------------------------------------- screenshot
@@ -735,10 +884,12 @@ impl Overlay {
     /// icon (check mark or warning); clicking it yields `Effect::OpenShot`.
     pub fn notify(&mut self, ok: bool, text: &str) {
         let n = render_notice(text, ok, self.theme, &self.lay);
+        self.erase_laser();
         self.set_notice(n);
         if self.notice.is_some() {
             unsafe { SetTimer(self.hwnd, NOTICE_TIMER, NOTICE_MS, None) };
         }
+        self.draw_laser();
         self.flush();
     }
 
@@ -865,8 +1016,9 @@ impl Overlay {
             let hover = self.hover == Some(*b);
             match b {
                 Btn::Pencil => {
-                    // The active tool is highlighted: the pencil unless selecting a screenshot.
-                    let bg = match (self.shot == Shot::Off, hover) {
+                    // The active tool is highlighted: the pencil unless using the laser or
+                    // selecting a screenshot.
+                    let bg = match (self.shot == Shot::Off && !self.laser_on, hover) {
                         (true, false) => Some(t.selected),
                         (true, true) => Some(t.selected_hover),
                         (false, true) => Some(t.hover),
@@ -885,6 +1037,24 @@ impl Overlay {
                         let dx = cx + (k as f32 - 1.5) * 7.0 * s;
                         cv.circle(dx, cy + 13.0 * s, rad * s, *kc);
                     }
+                }
+                Btn::Laser => {
+                    let bg = match (self.laser_on, hover) {
+                        (true, false) => Some(t.selected),
+                        (true, true) => Some(t.selected_hover),
+                        (false, true) => Some(t.hover),
+                        (false, false) => None,
+                    };
+                    if let Some(bg) = bg {
+                        cv.round_rect(r.0, r.1, r.2, r.3, 8.0 * s, bg);
+                    }
+                    // Pointer body with a glowing red beam spot at its tip.
+                    let (dx, dy) = (cx + 5.5 * s, cy - 5.5 * s);
+                    cv.capsule((cx - 8.0 * s, cy + 8.0 * s), (cx + 0.5 * s, cy - 0.5 * s), 2.6 * s, t.icon);
+                    let g = 6.0 * s;
+                    let glow = Rect::bounds(dx - g - 1.0, dy - g - 1.0, dx + g + 1.0, dy + g + 1.0);
+                    cv.fill_sdf(glow, laser::COLOR, 0.3, |x, y| ((x - dx).powi(2) + (y - dy).powi(2)).sqrt() - g);
+                    cv.circle(dx, dy, 2.8 * s, laser::COLOR);
                 }
                 Btn::Size => {
                     if hover {
@@ -974,6 +1144,7 @@ impl Overlay {
 
 impl Drop for Overlay {
     fn drop(&mut self) {
+        self.unhook();
         // The veil is owned by the overlay window: destroy it first.
         self.veil = None;
         // Then the window; `dib` and `under` are released automatically afterwards.
