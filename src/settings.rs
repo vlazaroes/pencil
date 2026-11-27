@@ -15,7 +15,9 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::UI::Controls::{
     InitCommonControlsEx, BST_CHECKED, BST_UNCHECKED, ICC_HOTKEY_CLASS, INITCOMMONCONTROLSEX,
 };
-use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForMonitor, SystemParametersInfoForDpi, MDT_EFFECTIVE_DPI};
+use windows_sys::Win32::UI::HiDpi::{
+    AdjustWindowRectExForDpi, GetDpiForMonitor, GetDpiForWindow, SystemParametersInfoForDpi, MDT_EFFECTIVE_DPI,
+};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetFocus, MOD_ALT, MOD_CONTROL, MOD_SHIFT};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -275,7 +277,7 @@ unsafe fn read_form(w: &Win) -> Result<Config, String> {
     if !keys.is_valid() {
         return Err(
             "Tool shortcuts must be different from each other.\n\
-             Esc, Delete, Backspace, Enter, Tab, Space and 1-4 are reserved."
+             Esc, Delete, Backspace, Enter, Tab and Space are reserved."
                 .into(),
         );
     }
@@ -327,12 +329,13 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             }
             0
         }
+        // Neither parameter is trusted: any process can send this message, and its
+        // lParam would be a pointer into that process. The window's real DPI is
+        // asked instead and the window keeps its position; `layout` resizes it.
         WM_DPICHANGED => {
             if let Some(w) = WIN.with(|w| w.get()) {
-                let w = layout(w, (wp & 0xFFFF) as u32);
+                let w = layout(w, GetDpiForWindow(hwnd));
                 WIN.with(|c| c.set(Some(w)));
-                let r = &*(lp as *const RECT);
-                SetWindowPos(hwnd, null_mut(), r.left, r.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
             }
             0
         }

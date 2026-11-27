@@ -11,17 +11,53 @@
 use std::path::{Path, PathBuf};
 use std::ptr::null;
 
-use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, PROCESS_INFORMATION, STARTF_FORCEOFFFEEDBACK, STARTUPINFOW,
+    CreateProcessW, GetExitCodeProcess, WaitForSingleObject, PROCESS_INFORMATION, STARTF_FORCEOFFFEEDBACK,
+    STARTUPINFOW,
 };
 
 use crate::wide;
 
+/// A started child process; the handle is closed on drop.
+pub struct Child(HANDLE);
+
+impl Child {
+    /// Waits up to `ms` for the process to end and returns its exit code, or
+    /// `None` if it is still running.
+    pub fn exit_code(&self, ms: u32) -> Option<u32> {
+        let mut code = 0u32;
+        unsafe {
+            (WaitForSingleObject(self.0, ms) == WAIT_OBJECT_0 && GetExitCodeProcess(self.0, &mut code) != 0)
+                .then_some(code)
+        }
+    }
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
 /// Starts `program` (a full path) with `args` and returns at once; the child runs
 /// on its own and its handles are closed right away.
 pub fn spawn_quiet(program: &Path, args: &[&str]) -> bool {
+    spawn(program, args).is_some()
+}
+
+/// Starts this same executable with `args` (helper modes such as `--play-shutter`).
+pub fn spawn_self(args: &[&str]) -> bool {
+    spawn_self_child(args).is_some()
+}
+
+/// Like `spawn_self`, but keeps the process handle to read its exit code later.
+pub fn spawn_self_child(args: &[&str]) -> Option<Child> {
+    spawn(&std::env::current_exe().ok()?, args)
+}
+
+fn spawn(program: &Path, args: &[&str]) -> Option<Child> {
     let mut cmd = quote(&program.to_string_lossy());
     for a in args {
         cmd.push(' ');
@@ -34,18 +70,12 @@ pub fn spawn_quiet(program: &Path, args: &[&str]) -> bool {
         si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
         si.dwFlags = STARTF_FORCEOFFFEEDBACK;
         let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
-        let ok = CreateProcessW(app.as_ptr(), cmd.as_mut_ptr(), null(), null(), 0, 0, null(), null(), &si, &mut pi) != 0;
-        if ok {
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
+        if CreateProcessW(app.as_ptr(), cmd.as_mut_ptr(), null(), null(), 0, 0, null(), null(), &si, &mut pi) == 0 {
+            return None;
         }
-        ok
+        CloseHandle(pi.hThread);
+        Some(Child(pi.hProcess))
     }
-}
-
-/// Starts this same executable with `args` (helper modes such as `--play-shutter`).
-pub fn spawn_self(args: &[&str]) -> bool {
-    std::env::current_exe().is_ok_and(|exe| spawn_quiet(&exe, args))
 }
 
 /// `%SystemRoot%\explorer.exe`, resolved from the system rather than the search path.
@@ -79,6 +109,13 @@ mod tests {
     fn spawns_a_process() {
         let cmd = explorer().unwrap().with_file_name("System32").join("cmd.exe");
         assert!(spawn_quiet(&cmd, &["/c", "exit"]));
+    }
+
+    #[test]
+    fn reads_the_exit_code() {
+        let cmd = explorer().unwrap().with_file_name("System32").join("cmd.exe");
+        let child = spawn(&cmd, &["/c", "exit", "7"]).expect("spawn");
+        assert_eq!(child.exit_code(10_000), Some(7));
     }
 
     #[test]

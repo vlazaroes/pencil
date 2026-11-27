@@ -232,8 +232,6 @@ fn is_modifier(vk: u16) -> bool {
 pub fn is_reserved(vk: u16) -> bool {
     is_modifier(vk)
         || matches!(vk, VK_ESCAPE | VK_DELETE | VK_BACK | VK_RETURN | VK_TAB | VK_SPACE)
-        || (0x31..=0x34).contains(&vk)
-        || (VK_NUMPAD1..=VK_NUMPAD4).contains(&vk)
 }
 
 /// Keys that need the "extended" flag for their name and for the hotkey control.
