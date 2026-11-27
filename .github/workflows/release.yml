@@ -27,8 +27,7 @@ jobs:
   release:
     runs-on: windows-latest
     steps:
-      # Pinned to a commit: a moved tag cannot change what runs. Dependabot updates it.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7
 
       # Expressions are passed through `env:` and never pasted into the scripts, so
       # no input value can turn into code.
